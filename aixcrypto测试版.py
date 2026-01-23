@@ -25,7 +25,7 @@ if _FRAMEWORK_DIR not in sys.path:
 from okx_wallet import OKXWallet
 
 # 版本号（用于自动更新比较）
-__version__ = "2026.01.27"
+__version__ = "2026.01.28"
 
 # 全局API地址参数
 ADSPOWER_API_BASE_URL = "http://127.0.0.1:50325"
@@ -886,7 +886,7 @@ def _check_and_handle_popups(page: ChromiumPage, main_tab_id: str, account_id: s
         pass
 
 
-def _wait_for_place_open_and_click(page: ChromiumPage, target_url: str, main_tab_id: str, account_id: str, max_clicks: Optional[int] = None):
+def _wait_for_place_open_and_click(page: ChromiumPage, target_url: str, main_tab_id: str, account_id: str, max_clicks: Optional[int] = None) -> bool:
     """
     监控状态元素：
     - 先等待出现 Place Success! 作为成功点击提示
@@ -907,10 +907,10 @@ def _wait_for_place_open_and_click(page: ChromiumPage, target_url: str, main_tab
         
         if STOP_FLAG:
             log(account_id, "收到停止信号，停止监控。")
-            return
+            return False
         if _is_countdown_state(page):
             log(account_id, "检测到倒计时状态，结束监控。")
-            return
+            return True
         placing_open = page.ele(
             "t:div@@class=flex items-center gap-2 text-xs capitalize text-emerald-400@@tx():Placing Open",
             timeout=1,
@@ -956,10 +956,10 @@ def _wait_for_place_open_and_click(page: ChromiumPage, target_url: str, main_tab
         _check_and_handle_popups(page, main_tab_id, account_id)
 
         if STOP_FLAG:
-            return
+            return False
         if _is_countdown_state(page):
             log(account_id, "检测到倒计时状态，结束监控。")
-            return
+            return True
         success = page.ele(
             "t:div@@class=text-white font-semibold text-base@@tx():Place Success!",
             timeout=0.2,
@@ -1027,12 +1027,12 @@ def _wait_for_place_open_and_click(page: ChromiumPage, target_url: str, main_tab
 
         if STOP_FLAG:
             log(account_id, "收到停止信号，停止监控。")
-            break
+            return False
         try:
             # 如果进入倒计时，表示次数已用完
             if _is_countdown_state(page):
                 log(account_id, "检测到倒计时状态，结束监控。")
-                break
+                return True
 
             # 每次循环都从页面文本读取剩余次数，避免点击失败导致计数错误
             remaining = _get_remaining_clicks(page)
@@ -1042,13 +1042,13 @@ def _wait_for_place_open_and_click(page: ChromiumPage, target_url: str, main_tab
                     log(account_id, "无法解析剩余次数，重试中...")
                 if none_count >= 60:
                     log(account_id, "连续无法解析剩余次数，视为已结束。")
-                    break
+                    return False
                 time.sleep(0.5)
                 continue
             none_count = 0
             if remaining <= 0:
                 log(account_id, "剩余次数为 0，结束监控。")
-                break
+                return True
             placing_open = page.ele(
                 "t:div@@class=flex items-center gap-2 text-xs capitalize text-emerald-400@@tx():Placing Open",
                 timeout=0.1,
@@ -1148,9 +1148,10 @@ def _wait_for_place_open_and_click(page: ChromiumPage, target_url: str, main_tab
             log(account_id, f"检测状态异常: {e}")
             time.sleep(0.3)
     log(account_id, f"已完成点击 {clicks} 次，结束监控。")
+    return True
 
 
-def _claim_all_rewards(page: ChromiumPage, tasks_url: str, main_tab_id: str, account_id: str):
+def _claim_all_rewards(page: ChromiumPage, tasks_url: str, main_tab_id: str, account_id: str) -> bool:
     """
     进入任务页面，点击所有包含“Claim Reward”的按钮。
     """
@@ -1162,11 +1163,11 @@ def _claim_all_rewards(page: ChromiumPage, tasks_url: str, main_tab_id: str, acc
         _check_and_handle_popups(page, main_tab_id, account_id)
 
         if STOP_FLAG:
-            return
+            return False
         buttons = page.eles("xpath://button[contains(normalize-space(),'Claim Reward')]")
         if not buttons:
             log(account_id, "未找到 Claim Reward 按钮，结束。")
-            return
+            return True
         log(account_id, f"检测到 {len(buttons)} 个 Claim Reward 按钮，开始逐个点击。")
         for btn in buttons:
             # 检查弹窗
@@ -1307,23 +1308,35 @@ def run_account_task(
             _try_detect_and_click(page, click_selector, account_id)
 
         # 监控状态并点击 Long/Short
-        _wait_for_place_open_and_click(page, url, main_tab_id, account_id)
-        _claim_all_rewards(page, "https://hub.aixcrypto.ai/#tasks", main_tab_id, account_id)
-        
+        place_done = _wait_for_place_open_and_click(page, url, main_tab_id, account_id)
+        if STOP_FLAG:
+            log(account_id, "收到停止信号，未记录完成状态。")
+            return
+        claim_done = _claim_all_rewards(page, "https://hub.aixcrypto.ai/#tasks", main_tab_id, account_id)
+        if STOP_FLAG:
+            log(account_id, "收到停止信号，未记录完成状态。")
+            return
+
         # 任务全部完成，记录状态
-        save_completed_task(account_id)
-        log(account_id, "任务全部完成，已记录状态。")
+        if place_done and claim_done:
+            save_completed_task(account_id)
+            log(account_id, "任务全部完成，已记录状态。")
+        else:
+            log(account_id, "任务未完整完成，未记录状态。")
         
+    except Exception as e:
+        log(account_id, f"任务执行异常: {e}")
+    finally:
         # 关闭浏览器
-        manager.close_browser(account_id)
+        try:
+            manager.close_browser(account_id)
+        except Exception:
+            pass
         try:
             if os.path.exists(debug_port_file):
                 os.remove(debug_port_file)
         except Exception:
             pass
-        
-    except Exception as e:
-        log(account_id, f"任务执行异常: {e}")
 
 
 if __name__ == "__main__":
