@@ -25,7 +25,7 @@ if _FRAMEWORK_DIR not in sys.path:
 from okx_wallet import OKXWallet
 
 # 版本号（用于自动更新比较）
-__version__ = "2026.01.26"
+__version__ = "2026.01.27"
 
 # 全局API地址参数
 ADSPOWER_API_BASE_URL = "http://127.0.0.1:50325"
@@ -944,26 +944,80 @@ def _wait_for_place_open_and_click(page: ChromiumPage, target_url: str, main_tab
                     timeout=6,
                 )
             break
-        time.sleep(0.3)
+        time.sleep(0.1)
 
-    # 等待 Place Success! 出现后再进入 Settling 流程
+    # 首次点击后，检测是否生效；若卡住则重试点击
+    initial_click_attempts = 1
+    initial_click_last_try = time.time()
+    initial_click_timeout = 10
+    initial_click_max_attempts = 3
     while True:
         # 检查弹窗
         _check_and_handle_popups(page, main_tab_id, account_id)
 
         if STOP_FLAG:
             return
-        # log(account_id, "等待 Place Success! 出现中...")
+        if _is_countdown_state(page):
+            log(account_id, "检测到倒计时状态，结束监控。")
+            return
         success = page.ele(
             "t:div@@class=text-white font-semibold text-base@@tx():Place Success!",
-            timeout=1,
+            timeout=0.2,
         )
+        settling = page.ele("xpath://div[contains(normalize-space(),'Settling')]", timeout=0.2)
         if success:
             log(account_id, "检测到 Place Success!，开始等待 Settling...")
             stage = "wait_settling"
             stage_start = time.time()
             break
-        time.sleep(0.3)
+        if settling:
+            log(account_id, "未检测到 Place Success，但检测到 Settling，继续等待 Settling 结束...")
+            stage = "wait_settling"
+            stage_start = time.time()
+            break
+
+        placing_open = page.ele(
+            "t:div@@class=flex items-center gap-2 text-xs capitalize text-emerald-400@@tx():Placing Open",
+            timeout=0.2,
+        )
+        if placing_open and time.time() - initial_click_last_try > initial_click_timeout:
+            if initial_click_attempts < initial_click_max_attempts:
+                initial_click_attempts += 1
+                initial_click_last_try = time.time()
+                log(account_id, f"首次点击未生效，重试第 {initial_click_attempts} 次点击。")
+                retry_choice = random.choice(["long", "short"])
+                if retry_choice == "long":
+                    _try_detect_and_click(
+                        page,
+                        "t:div@@class=w-full py-3 rounded-lg font-medium text-center transition-all "
+                        "flex items-center justify-center gap-2@@tx():Place Long",
+                        account_id=account_id,
+                        timeout=6,
+                    ) or _try_detect_and_click(
+                        page,
+                        "xpath://div[contains(normalize-space(),'Place Long')]",
+                        account_id=account_id,
+                        timeout=6,
+                    )
+                else:
+                    _try_detect_and_click(
+                        page,
+                        "t:div@@class=w-full py-3 rounded-lg font-medium text-center transition-all "
+                        "flex items-center justify-center gap-2@@tx():Place Short",
+                        account_id=account_id,
+                        timeout=6,
+                    ) or _try_detect_and_click(
+                        page,
+                        "xpath://div[contains(normalize-space(),'Place Short')]",
+                        account_id=account_id,
+                        timeout=6,
+                    )
+            else:
+                log(account_id, "首次点击多次未生效，继续进入监控流程。")
+                stage = "wait_next_open"
+                stage_start = time.time()
+                break
+        time.sleep(0.1)
 
     # 继续沿用上一步的阶段（已设为 wait_settling）
     none_count = 0
@@ -1046,7 +1100,7 @@ def _wait_for_place_open_and_click(page: ChromiumPage, target_url: str, main_tab
                     stage = "wait_success"
                     stage_start = time.time()
                 else:
-                    time.sleep(0.3)
+                    time.sleep(0.1)
                 continue
 
             if stage == "wait_success":
@@ -1089,10 +1143,10 @@ def _wait_for_place_open_and_click(page: ChromiumPage, target_url: str, main_tab
                 time.sleep(0.05)
                 continue
 
-            time.sleep(1)
+            time.sleep(0.2)
         except Exception as e:
             log(account_id, f"检测状态异常: {e}")
-            time.sleep(1)
+            time.sleep(0.3)
     log(account_id, f"已完成点击 {clicks} 次，结束监控。")
 
 
