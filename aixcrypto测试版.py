@@ -25,7 +25,7 @@ if _FRAMEWORK_DIR not in sys.path:
 from okx_wallet import OKXWallet
 
 # 版本号（用于自动更新比较）
-__version__ = "2026.01.28"
+__version__ = "2026.01.30"
 
 # 全局API地址参数
 ADSPOWER_API_BASE_URL = "http://127.0.0.1:50325"
@@ -886,7 +886,7 @@ def _check_and_handle_popups(page: ChromiumPage, main_tab_id: str, account_id: s
         pass
 
 
-def _wait_for_place_open_and_click(page: ChromiumPage, target_url: str, main_tab_id: str, account_id: str, max_clicks: Optional[int] = None) -> bool:
+def _wait_for_place_open_and_click(page: ChromiumPage, target_url: str, main_tab_id: str, account_id: str, max_clicks: Optional[int] = None, max_total_seconds: int = 900) -> bool:
     """
     监控状态元素：
     - 先等待出现 Place Success! 作为成功点击提示
@@ -898,6 +898,7 @@ def _wait_for_place_open_and_click(page: ChromiumPage, target_url: str, main_tab
     log(account_id, "已切回页面，等待 2 秒加载...")
     time.sleep(2)
     clicks = 0
+    overall_start = time.time()
     remaining = max_clicks
     # 首次进入先等待 Placing Open 可点击再触发一次点击
     log(account_id, "首次进入页面，等待 Placing Open 可点击后触发一次点击...")
@@ -907,6 +908,9 @@ def _wait_for_place_open_and_click(page: ChromiumPage, target_url: str, main_tab
         
         if STOP_FLAG:
             log(account_id, "收到停止信号，停止监控。")
+            return False
+        if time.time() - overall_start > max_total_seconds:
+            log(account_id, f"长时间未检测到可点击状态，触发超时({max_total_seconds}s)，将结束该窗口。")
             return False
         if _is_countdown_state(page):
             log(account_id, "检测到倒计时状态，结束监控。")
@@ -956,6 +960,9 @@ def _wait_for_place_open_and_click(page: ChromiumPage, target_url: str, main_tab
         _check_and_handle_popups(page, main_tab_id, account_id)
 
         if STOP_FLAG:
+            return False
+        if time.time() - overall_start > max_total_seconds:
+            log(account_id, f"长时间未进入有效状态，触发超时({max_total_seconds}s)，将结束该窗口。")
             return False
         if _is_countdown_state(page):
             log(account_id, "检测到倒计时状态，结束监控。")
@@ -1027,6 +1034,9 @@ def _wait_for_place_open_and_click(page: ChromiumPage, target_url: str, main_tab
 
         if STOP_FLAG:
             log(account_id, "收到停止信号，停止监控。")
+            return False
+        if time.time() - overall_start > max_total_seconds:
+            log(account_id, f"监控超时({max_total_seconds}s)，将结束该窗口。")
             return False
         try:
             # 如果进入倒计时，表示次数已用完
@@ -1382,38 +1392,47 @@ if __name__ == "__main__":
         import threading
         semaphore = threading.Semaphore(thread_count)
 
-        with ThreadPoolExecutor(max_workers=thread_count) as executor:
-            # 提交所有任务
-            futures = []
-            for account in target_accounts:
-                semaphore.acquire() # 获取信号量
-                
-                # 再次检查是否已完成 (防止在排队期间状态已变更)
-                if is_account_completed(account.id):
-                    log(account.id, "在排队期间检测到任务已完成，跳过。")
-                    semaphore.release()
-                    continue
+        def _run_batch(accounts: List[AccountInfo], round_name: str):
+            log("SYSTEM", f"{round_name}：开始执行 {len(accounts)} 个账号。")
+            with ThreadPoolExecutor(max_workers=thread_count) as executor:
+                futures = []
+                for account in accounts:
+                    semaphore.acquire() # 获取信号量
 
-                def task_wrapper(acc, key):
+                    # 再次检查是否已完成 (防止在排队期间状态已变更)
+                    if is_account_completed(account.id):
+                        log(account.id, "在排队期间检测到任务已完成，跳过。")
+                        semaphore.release()
+                        continue
+
+                    def task_wrapper(acc, key):
+                        try:
+                            run_account_task(acc, api_key=key)
+                        except Exception as e:
+                            log(acc.id, f"任务wrapper异常: {e}")
+                        finally:
+                            semaphore.release() # 释放信号量
+
+                    future = executor.submit(task_wrapper, account, ADSPOWER_API_KEY)
+                    futures.append(future)
+
+                    import time
+                    time.sleep(3) # 稍微错开启动时间，避免并发请求AdsPower API导致拥堵
+
+                # 等待所有任务完成
+                for future in futures:
                     try:
-                        run_account_task(acc, api_key=key)
+                        future.result()
                     except Exception as e:
-                         log(acc.id, f"任务wrapper异常: {e}")
-                    finally:
-                        semaphore.release() # 释放信号量
+                        print(f"线程执行异常: {e}")
 
-                future = executor.submit(task_wrapper, account, ADSPOWER_API_KEY)
-                futures.append(future)
-                
-                import time
-                time.sleep(3) # 稍微错开启动时间，避免并发请求AdsPower API导致拥堵
-                
-            # 等待所有任务完成
-            for future in futures:
-                try:
-                    future.result()
-                except Exception as e:
-                    print(f"线程执行异常: {e}")
+        # 第一轮
+        _run_batch(target_accounts, "第一轮")
+
+        # 第二轮：只补跑未完成
+        remaining_accounts = [acc for acc in target_accounts if not is_account_completed(acc.id)]
+        if remaining_accounts and not STOP_FLAG:
+            _run_batch(remaining_accounts, "第二轮补跑")
                 
     else:
         print("无效输入，退出。")
