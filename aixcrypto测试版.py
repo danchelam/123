@@ -25,7 +25,7 @@ if _FRAMEWORK_DIR not in sys.path:
 from okx_wallet import OKXWallet
 
 # 版本号（用于自动更新比较）
-__version__ = "2026.01.30"
+__version__ = "2026.01.31"
 
 # 全局API地址参数
 ADSPOWER_API_BASE_URL = "http://127.0.0.1:50325"
@@ -898,7 +898,8 @@ def _wait_for_place_open_and_click(page: ChromiumPage, target_url: str, main_tab
     log(account_id, "已切回页面，等待 2 秒加载...")
     time.sleep(2)
     clicks = 0
-    overall_start = time.time()
+    last_progress = time.time()
+    last_remaining = None
     remaining = max_clicks
     # 首次进入先等待 Placing Open 可点击再触发一次点击
     log(account_id, "首次进入页面，等待 Placing Open 可点击后触发一次点击...")
@@ -909,8 +910,8 @@ def _wait_for_place_open_and_click(page: ChromiumPage, target_url: str, main_tab
         if STOP_FLAG:
             log(account_id, "收到停止信号，停止监控。")
             return False
-        if time.time() - overall_start > max_total_seconds:
-            log(account_id, f"长时间未检测到可点击状态，触发超时({max_total_seconds}s)，将结束该窗口。")
+        if time.time() - last_progress > max_total_seconds:
+            log(account_id, f"长时间无进展，触发超时({max_total_seconds}s)，将结束该窗口。")
             return False
         if _is_countdown_state(page):
             log(account_id, "检测到倒计时状态，结束监控。")
@@ -922,7 +923,7 @@ def _wait_for_place_open_and_click(page: ChromiumPage, target_url: str, main_tab
         if placing_open:
             first_choice = random.choice(["long", "short"])
             if first_choice == "long":
-                _try_detect_and_click(
+                clicked = _try_detect_and_click(
                     page,
                     "t:div@@class=w-full py-3 rounded-lg font-medium text-center transition-all "
                     "flex items-center justify-center gap-2@@tx():Place Long",
@@ -935,7 +936,7 @@ def _wait_for_place_open_and_click(page: ChromiumPage, target_url: str, main_tab
                     timeout=6,
                 )
             else:
-                _try_detect_and_click(
+                clicked = _try_detect_and_click(
                     page,
                     "t:div@@class=w-full py-3 rounded-lg font-medium text-center transition-all "
                     "flex items-center justify-center gap-2@@tx():Place Short",
@@ -947,6 +948,8 @@ def _wait_for_place_open_and_click(page: ChromiumPage, target_url: str, main_tab
                     account_id=account_id,
                     timeout=6,
                 )
+            if clicked:
+                last_progress = time.time()
             break
         time.sleep(0.1)
 
@@ -961,8 +964,8 @@ def _wait_for_place_open_and_click(page: ChromiumPage, target_url: str, main_tab
 
         if STOP_FLAG:
             return False
-        if time.time() - overall_start > max_total_seconds:
-            log(account_id, f"长时间未进入有效状态，触发超时({max_total_seconds}s)，将结束该窗口。")
+        if time.time() - last_progress > max_total_seconds:
+            log(account_id, f"长时间无进展，触发超时({max_total_seconds}s)，将结束该窗口。")
             return False
         if _is_countdown_state(page):
             log(account_id, "检测到倒计时状态，结束监控。")
@@ -976,11 +979,13 @@ def _wait_for_place_open_and_click(page: ChromiumPage, target_url: str, main_tab
             log(account_id, "检测到 Place Success!，开始等待 Settling...")
             stage = "wait_settling"
             stage_start = time.time()
+            last_progress = time.time()
             break
         if settling:
             log(account_id, "未检测到 Place Success，但检测到 Settling，继续等待 Settling 结束...")
             stage = "wait_settling"
             stage_start = time.time()
+            last_progress = time.time()
             break
 
         placing_open = page.ele(
@@ -1019,6 +1024,7 @@ def _wait_for_place_open_and_click(page: ChromiumPage, target_url: str, main_tab
                         account_id=account_id,
                         timeout=6,
                     )
+                last_progress = time.time()
             else:
                 log(account_id, "首次点击多次未生效，继续进入监控流程。")
                 stage = "wait_next_open"
@@ -1035,8 +1041,8 @@ def _wait_for_place_open_and_click(page: ChromiumPage, target_url: str, main_tab
         if STOP_FLAG:
             log(account_id, "收到停止信号，停止监控。")
             return False
-        if time.time() - overall_start > max_total_seconds:
-            log(account_id, f"监控超时({max_total_seconds}s)，将结束该窗口。")
+        if time.time() - last_progress > max_total_seconds:
+            log(account_id, f"长时间无进展，触发超时({max_total_seconds}s)，将结束该窗口。")
             return False
         try:
             # 如果进入倒计时，表示次数已用完
@@ -1056,6 +1062,9 @@ def _wait_for_place_open_and_click(page: ChromiumPage, target_url: str, main_tab
                 time.sleep(0.5)
                 continue
             none_count = 0
+            if last_remaining is not None and remaining < last_remaining:
+                last_progress = time.time()
+            last_remaining = remaining
             if remaining <= 0:
                 log(account_id, "剩余次数为 0，结束监控。")
                 return True
@@ -1087,6 +1096,7 @@ def _wait_for_place_open_and_click(page: ChromiumPage, target_url: str, main_tab
                             timeout=6,
                         ):
                             clicks += 1
+                            last_progress = time.time()
                     else:
                         if _try_detect_and_click(
                             page,
@@ -1101,6 +1111,7 @@ def _wait_for_place_open_and_click(page: ChromiumPage, target_url: str, main_tab
                             timeout=6,
                         ):
                             clicks += 1
+                            last_progress = time.time()
                     # 点击后稍等再读取一次剩余次数，避免显示滞后
                     time.sleep(0.5)
                     remaining_after = _get_remaining_clicks(page)
@@ -1118,10 +1129,12 @@ def _wait_for_place_open_and_click(page: ChromiumPage, target_url: str, main_tab
                     log(account_id, "检测到 Place Success!，等待 Settling 出现...")
                     stage = "wait_settling"
                     stage_start = time.time()
+                    last_progress = time.time()
                 elif settling:
                     log(account_id, "未检测到 Place Success，但检测到 Settling，继续等待 Settling 结束...")
                     stage = "wait_settling"
                     stage_start = time.time()
+                    last_progress = time.time()
                 elif time.time() - stage_start > 60:
                     log(account_id, "等待 Place Success 超时，继续等待下一个 Placing Open...")
                     stage = "wait_next_open"
