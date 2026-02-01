@@ -36,7 +36,7 @@ if not _okx_loaded:
     raise ImportError("okx_wallet 未找到，请确保 前段框架/okx_wallet.py 或同目录 okx_wallet.py 存在")
 
 # 版本号（用于自动更新比较）
-__version__ = "2026.02.01.11"
+__version__ = "2026.02.01.12"
 
 # 全局API地址参数
 ADSPOWER_API_BASE_URL = "http://127.0.0.1:50325"
@@ -1294,11 +1294,8 @@ def run_account_task(
         # 记录任务页主标签，供后续切回
         main_tab_id = page.tab_id
 
-        # 进入网站后解锁OKX钱包（若 okx_wallet 支持 log 则传入，便于在界面看到详细日志）
-        try:
-            wallet = OKXWallet(page, log=lambda msg: log(account_id, msg))
-        except TypeError:
-            wallet = OKXWallet(page)
+        # 进入网站后解锁OKX钱包（不传 log，兼容旧版 okx_wallet；新版 okx_wallet 可接受 log 参数，此处不传则详细日志走 print）
+        wallet = OKXWallet(page)
         if wallet.unlock():
             log(account_id, "OKX 钱包解锁成功。")
         else:
