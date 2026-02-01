@@ -17,15 +17,26 @@ import datetime
 import json
 from concurrent.futures import ThreadPoolExecutor
 
-# 引入前段框架里的 OKX 解锁模块（与 EXE 同目录下的 前段框架 子目录，热更新会写入此处）
+# 引入 OKX 解锁模块：优先 前段框架 子目录，若无则用脚本同目录（热更新回退会写同目录）
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 _FRAMEWORK_DIR = os.path.join(_BASE_DIR, "前段框架")
-if _FRAMEWORK_DIR not in sys.path:
-    sys.path.append(_FRAMEWORK_DIR)
-from okx_wallet import OKXWallet
+_okx_loaded = False
+for _try_dir in (_FRAMEWORK_DIR, _BASE_DIR):
+    if _try_dir not in sys.path:
+        sys.path.insert(0, _try_dir)
+    try:
+        from okx_wallet import OKXWallet
+        _okx_loaded = True
+        break
+    except ImportError:
+        if "okx_wallet" in sys.modules:
+            del sys.modules["okx_wallet"]
+        pass
+if not _okx_loaded:
+    raise ImportError("okx_wallet 未找到，请确保 前段框架/okx_wallet.py 或同目录 okx_wallet.py 存在")
 
 # 版本号（用于自动更新比较）
-__version__ = "2026.02.01.6"
+__version__ = "2026.02.01.7"
 
 # 全局API地址参数
 ADSPOWER_API_BASE_URL = "http://127.0.0.1:50325"
