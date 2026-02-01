@@ -25,7 +25,7 @@ if _FRAMEWORK_DIR not in sys.path:
 from okx_wallet import OKXWallet
 
 # 版本号（用于自动更新比较）
-__version__ = "2026.02.01"
+__version__ = "2026.02.02"
 
 # 全局API地址参数
 ADSPOWER_API_BASE_URL = "http://127.0.0.1:50325"
