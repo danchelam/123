@@ -147,51 +147,100 @@ class OKXWallet:
                     time.sleep(2)
 
                 if not retry_loaded:
-                    _log("扩展页面文本为空，尝试使用 JS 查找密码框...")
+                    _log("扩展页面文本为空，尝试使用 JS 查找密码框（含 iframe/shadow）...")
                     try:
-                        js_ok = unlock_tab.run_js("""
-                        (function(pwd){
-                          function findIn(root){
-                            if(!root) return null;
+                        js_result = unlock_tab.run_js("""
+                        return (function(pwd){
+                          function findInputInDoc(doc){
+                            if(!doc) return null;
                             try{
-                              var el = root.querySelector('input[type="password"]');
+                              var el = doc.querySelector('input[type="password"]');
                               if(el) return el;
-                              var all = root.querySelectorAll('*');
+                              var all = doc.querySelectorAll('*');
                               for (var i=0;i<all.length;i++){
                                 var n = all[i];
                                 if(n && n.shadowRoot){
-                                  var found = findIn(n.shadowRoot);
+                                  var found = findInputInDoc(n.shadowRoot);
                                   if(found) return found;
                                 }
                               }
                             }catch(e){}
                             return null;
                           }
-                          var input = findIn(document);
-                          if(!input) return false;
+                          function findBtnInDoc(doc){
+                            if(!doc) return null;
+                            try{
+                              return doc.querySelector('button[data-testid="okd-button"][type="submit"]') ||
+                                     doc.querySelector('button[type="submit"]');
+                            }catch(e){}
+                            return null;
+                          }
+                          var input = findInputInDoc(document);
+                          var btn = findBtnInDoc(document);
+                          try{
+                            var iframes = document.querySelectorAll('iframe');
+                            for (var i=0;i<iframes.length && !input;i++){
+                              try{
+                                var idoc = iframes[i].contentDocument;
+                                if(idoc){
+                                  input = findInputInDoc(idoc);
+                                  if(input && !btn) btn = findBtnInDoc(idoc);
+                                }
+                              }catch(e){}
+                            }
+                          }catch(e){}
+                          if(!input) return {found:false};
                           try{
                             input.focus();
                             input.value = pwd;
                             input.dispatchEvent(new Event('input', {bubbles:true}));
                             input.dispatchEvent(new Event('change', {bubbles:true}));
                           }catch(e){}
-                          var btn = document.querySelector('button[data-testid="okd-button"][type="submit"]') ||
-                                    document.querySelector('button[type="submit"]');
                           if(btn){
                             try{ btn.click(); }catch(e){}
                           }
-                          return true;
+                          return {found:true};
                         })(arguments[0]);
                         """, password)
                     except Exception as e:
-                        js_ok = False
+                        js_result = {"found": False}
                         _log("JS 查找密码框异常: %s" % e)
 
-                    if js_ok:
+                    if js_result and js_result.get("found"):
                         _log("JS 已尝试填写密码并点击解锁，等待结果...")
                         time.sleep(2)
                         try:
-                            still_locked = unlock_tab.run_js("return !!document.querySelector('input[type=\"password\"]')")
+                            still_locked = unlock_tab.run_js("""
+                            return (function(){
+                              function findInputInDoc(doc){
+                                if(!doc) return null;
+                                try{
+                                  var el = doc.querySelector('input[type="password"]');
+                                  if(el) return el;
+                                  var all = doc.querySelectorAll('*');
+                                  for (var i=0;i<all.length;i++){
+                                    var n = all[i];
+                                    if(n && n.shadowRoot){
+                                      var found = findInputInDoc(n.shadowRoot);
+                                      if(found) return found;
+                                    }
+                                  }
+                                }catch(e){}
+                                return null;
+                              }
+                              if(findInputInDoc(document)) return true;
+                              try{
+                                var iframes = document.querySelectorAll('iframe');
+                                for (var i=0;i<iframes.length;i++){
+                                  try{
+                                    var idoc = iframes[i].contentDocument;
+                                    if(findInputInDoc(idoc)) return true;
+                                  }catch(e){}
+                                }
+                              }catch(e){}
+                              return false;
+                            })();
+                            """)
                         except Exception:
                             still_locked = False
                         if not still_locked:
@@ -200,7 +249,7 @@ class OKXWallet:
                         _log("JS 解锁后密码框仍存在，判定未解锁。")
                         return False
 
-                    _log("【失败】扩展页面文本为空，判定未解锁（可能未加载完成或页面异常）。")
+                    _log("【失败】扩展页面文本为空，且 JS 未找到密码框，判定未解锁。")
                     return False
 
                 blocked_keywords = ("ERR_BLOCKED_BY_CLIENT", "This site can’t be reached", "无法访问此网站", "ERR_FAILED")
@@ -263,7 +312,7 @@ class OKXWallet:
             return False
 
 # 版本号（用于自动更新比较）
-__version__ = "2026.02.06"
+__version__ = "2026.02.07"
 
 # 全局API地址参数
 ADSPOWER_API_BASE_URL = "http://127.0.0.1:50325"
