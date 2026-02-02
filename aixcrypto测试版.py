@@ -17,26 +17,174 @@ import datetime
 import json
 from concurrent.futures import ThreadPoolExecutor
 
-# 引入 OKX 解锁模块：优先 前段框架 子目录，若无则用脚本同目录（热更新回退会写同目录）
-_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-_FRAMEWORK_DIR = os.path.join(_BASE_DIR, "前段框架")
-_okx_loaded = False
-for _try_dir in (_FRAMEWORK_DIR, _BASE_DIR):
-    if _try_dir not in sys.path:
-        sys.path.insert(0, _try_dir)
-    try:
-        from okx_wallet import OKXWallet
-        _okx_loaded = True
-        break
-    except ImportError:
-        if "okx_wallet" in sys.modules:
-            del sys.modules["okx_wallet"]
-        pass
-if not _okx_loaded:
-    raise ImportError("okx_wallet 未找到，请确保 前段框架/okx_wallet.py 或同目录 okx_wallet.py 存在")
+# 内置 OKX 解锁模块（避免依赖单独的 okx_wallet.py）
+class OKXWallet:
+    """
+    OKX钱包自动化操作模块
+    """
+    DEFAULT_PASSWORD = "DD112211"
+
+    def __init__(self, page: ChromiumPage, log=None):
+        """
+        初始化，传入已打开OKX弹窗的ChromiumPage对象。
+        :param log: 可选，日志回调 log(msg)，若传入则详细日志会通过此回调输出
+        """
+        self.page = page
+        self.log = log
+
+    def unlock(self, password: str = None) -> bool:
+        """
+        输入密码并点击解锁按钮，完成钱包解锁。
+        :param password: 钱包密码，默认用类属性DEFAULT_PASSWORD
+        :return: 解锁是否成功
+        """
+        if password is None:
+            password = self.DEFAULT_PASSWORD
+
+        import time
+        import traceback
+
+        def _log(msg):
+            text = "[OKX解锁] %s" % msg
+            if self.log:
+                self.log(text)
+            else:
+                print(text)
+
+        # 1. 记录操作前的标签页
+        before_tabs = set(self.page.tab_ids)
+        _log("步骤1: 打开插件前 tab_ids=%s" % (list(before_tabs)[:5] if len(before_tabs) > 5 else list(before_tabs)))
+
+        okx_url = "chrome-extension://mcohilncbfahbmgdjkbpemcciiolgcge/popup.html"
+        self.page.get(okx_url)
+        time.sleep(2)
+
+        after_tabs = set(self.page.tab_ids)
+        new_tab_ids = after_tabs - before_tabs
+        _log("步骤2: 打开插件后 tab_ids=%s, 新tab=%s" % (list(after_tabs)[:5] if len(after_tabs) > 5 else list(after_tabs), list(new_tab_ids)))
+
+        unlock_tab = None
+        if new_tab_ids:
+            unlock_tab_id = new_tab_ids.pop()
+            unlock_tab = self.page.get_tab(unlock_tab_id)
+            _log("使用新弹窗 tab_id=%s" % unlock_tab_id)
+        else:
+            unlock_tab = self.page.latest_tab
+            _log("无新弹窗，使用 latest_tab")
+
+        if not hasattr(unlock_tab, 'ele'):
+            _log("【失败】unlock_tab 无 ele 方法")
+            return False
+
+        try:
+            tab_url = getattr(unlock_tab, 'url', None) or ''
+            _log("步骤3: 当前操作页 URL=%s" % (tab_url[:80] if tab_url else "(无)"))
+
+            # 查找密码框
+            password_selectors = [
+                ('xpath', 'xpath://input[@data-testid="okd-input" and @type="password"]'),
+                ('css', 'css:input[data-testid=okd-input][type=password]'),
+                ('tag', 'tag:input@@data-testid=okd-input@@type=password'),
+                ('placeholder', 'xpath://input[@type="password" and @placeholder="请输入密码"]'),
+                ('xpath_generic', 'xpath://input[@type="password"]'),
+                ('css_generic', 'css:input[type=password]'),
+            ]
+            password_input = None
+            used_selector = None
+            for attempt in range(3):
+                for name, sel in password_selectors:
+                    password_input = unlock_tab.ele(sel, timeout=5)
+                    if password_input:
+                        used_selector = name
+                        break
+                if password_input:
+                    break
+                _log("第 %d 轮未找到密码框，2秒后重试..." % (attempt + 1))
+                time.sleep(2)
+
+            if not password_input:
+                # 未找到密码框：可能是扩展未加载、加载慢，也可能是已经解锁
+                if not tab_url.startswith("chrome-extension://"):
+                    _log("【失败】未进入 OKX 扩展页面（当前非 chrome-extension://），请检查扩展是否安装/是否被策略禁用。")
+                    return False
+
+                try:
+                    page_text = unlock_tab.ele("tag:body", timeout=3).text or ""
+                except Exception:
+                    page_text = ""
+
+                if not page_text.strip():
+                    # 部分机器扩展页会出现“空白文本”，此时不应误判为已解锁
+                    time.sleep(2)
+                    try:
+                        page_text = unlock_tab.ele("tag:body", timeout=3).text or ""
+                    except Exception:
+                        page_text = ""
+                    if not page_text.strip():
+                        _log("【失败】扩展页面文本为空，判定未解锁（可能未加载完成或页面异常）。")
+                        return False
+
+                blocked_keywords = ("ERR_BLOCKED_BY_CLIENT", "This site can’t be reached", "无法访问此网站", "ERR_FAILED")
+                if any(k in page_text for k in blocked_keywords):
+                    _log("【失败】OKX 扩展页面加载失败（疑似被阻止或扩展不可用）。")
+                    return False
+
+                # 判断是否仍处于“锁定”界面
+                lock_keywords = ("解锁", "Unlock", "请输入密码", "输入密码", "Password")
+                if any(k in page_text for k in lock_keywords):
+                    _log("【失败】页面含锁定提示但未找到密码框，判定为未解锁。")
+                    return False
+
+                _log("未找到密码框且无锁定提示，判定为“已解锁”。")
+                return True
+
+            _log("步骤4: 已找到密码框(选择器=%s)，开始输入密码" % used_selector)
+            password_input.click()
+            time.sleep(0.2)
+            password_input.input(password)
+            time.sleep(0.2)
+            try:
+                password_input.run_js("this.value = arguments[0]; this.dispatchEvent(new Event('input', { bubbles: true }));", password)
+                _log("已用JS补写密码并触发input事件")
+            except Exception as js_e:
+                _log("JS补写密码异常(可忽略): %s" % js_e)
+            time.sleep(0.3)
+
+            unlock_btn_selectors = [
+                ('xpath_okd', 'xpath://button[@data-testid="okd-button" and @type="submit"]'),
+                ('css_okd', 'css:button[data-testid=okd-button][type=submit]'),
+                ('tag_okd', 'tag:button@@data-testid=okd-button@@type=submit'),
+                ('xpath_submit', 'xpath://button[@type="submit"]'),
+            ]
+            unlock_btn = None
+            btn_sel_used = None
+            for name, sel in unlock_btn_selectors:
+                unlock_btn = unlock_tab.ele(sel, timeout=5)
+                if unlock_btn:
+                    btn_sel_used = name
+                    break
+            if not unlock_btn:
+                _log("【失败】未找到解锁按钮。当前页URL=%s" % (tab_url[:80] if tab_url else "(无)"))
+                return False
+
+            _log("步骤5: 已找到解锁按钮(选择器=%s)，点击" % btn_sel_used)
+            unlock_btn.click()
+            time.sleep(2)
+
+            password_input_after = unlock_tab.ele('tag:input@@data-testid=okd-input@@type=password', timeout=3)
+            if password_input_after:
+                _log("【失败】点击后密码框仍存在，可能密码错误或未真正解锁")
+                return False
+            _log("步骤6: 解锁成功(密码框已消失)")
+            return True
+
+        except Exception as e:
+            _log("【失败】异常: %s" % e)
+            _log(traceback.format_exc())
+            return False
 
 # 版本号（用于自动更新比较）
-__version__ = "2026.02.02.6"
+__version__ = "2026.02.03"
 
 # 全局API地址参数
 ADSPOWER_API_BASE_URL = "http://127.0.0.1:50325"
@@ -1295,11 +1443,7 @@ def run_account_task(
         main_tab_id = page.tab_id
 
         # 进入网站后解锁OKX钱包（不传 log，兼容旧版 okx_wallet；新版 okx_wallet 可接受 log 参数，此处不传则详细日志走 print）
-        try:
-            wallet = OKXWallet(page, log=lambda msg: log(account_id, msg))
-        except TypeError:
-            # 兼容旧版 okx_wallet.py（不支持 log 参数）
-            wallet = OKXWallet(page)
+        wallet = OKXWallet(page, log=lambda msg: log(account_id, msg))
         if wallet.unlock():
             log(account_id, "OKX 钱包解锁成功。")
         else:
