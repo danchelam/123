@@ -61,16 +61,27 @@ class OKXWallet:
         
         try:
             # 3. 查找密码输入框（多轮等待，避免该电脑加载慢或选错 Tab 导致误判为“已解锁”）
+            password_selectors = [
+                'tag:input@@data-testid=okd-input@@type=password',
+                'xpath://input[@data-testid="okd-input" and @type="password"]',
+                'css:input[data-testid=okd-input][type=password]',
+                'xpath://input[@type="password" and @placeholder="请输入密码"]',
+                'xpath://input[@type="password"]',
+                'css:input[type=password]',
+            ]
             password_input = None
             for attempt in range(3):
-                password_input = unlock_tab.ele('tag:input@@data-testid=okd-input@@type=password', timeout=8)
+                for sel in password_selectors:
+                    password_input = unlock_tab.ele(sel, timeout=5)
+                    if password_input:
+                        break
                 if password_input:
                     break
                 time.sleep(2)
                 print(f"第 {attempt + 1} 次未找到密码框，等待后重试...")
 
             if not password_input:
-                # 未找到密码框：可能是扩展未加载，也可能是已经解锁
+                # 未找到密码框：可能是扩展未加载、加载慢，也可能是已经解锁
                 current_url = getattr(unlock_tab, "url", "") or ""
                 if not current_url.startswith("chrome-extension://"):
                     print("【解锁失败】未进入 OKX 扩展页面（当前非 chrome-extension://），请检查扩展是否安装/是否被策略禁用。")
@@ -86,8 +97,13 @@ class OKXWallet:
                     print("【解锁失败】OKX 扩展页面加载失败（疑似被阻止或扩展不可用）。")
                     return False
 
-                # 未找到密码框但确实在扩展页，按“已解锁”处理（避免已解锁时误判失败）
-                print("未找到密码框，但已进入 OKX 扩展页面，判定为“已解锁”。")
+                lock_keywords = ("解锁", "Unlock", "请输入密码", "输入密码", "Password")
+                if any(k in page_text for k in lock_keywords):
+                    print("【解锁失败】页面含锁定提示但未找到密码框，判定为未解锁。")
+                    return False
+
+                # 未找到密码框且无锁定提示，按“已解锁”处理
+                print("未找到密码框且无锁定提示，判定为“已解锁”。")
                 return True
 
             # 确保焦点在输入框后输入，并仅在确认输入+点击解锁成功后才返回 True
