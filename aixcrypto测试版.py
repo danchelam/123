@@ -80,6 +80,22 @@ class OKXWallet:
             tab_url = getattr(unlock_tab, 'url', None) or ''
             _log("步骤3: 当前操作页 URL=%s" % (tab_url[:80] if tab_url else "(无)"))
 
+            # 有些电脑会打开到 offscreen.html（无界面），需要强制打开 popup.html
+            if tab_url.endswith("/offscreen.html"):
+                _log("检测到 offscreen 页面，尝试强制打开 popup.html")
+                try:
+                    before_tabs2 = set(self.page.tab_ids)
+                    self.page.run_js("window.open(arguments[0], '_blank');", okx_url)
+                    time.sleep(2)
+                    after_tabs2 = set(self.page.tab_ids)
+                    new_tabs2 = list(after_tabs2 - before_tabs2)
+                    if new_tabs2:
+                        unlock_tab = self.page.get_tab(new_tabs2[0])
+                        tab_url = getattr(unlock_tab, 'url', None) or ''
+                        _log("已切到 popup tab_id=%s URL=%s" % (unlock_tab.tab_id, tab_url[:80]))
+                except Exception as e:
+                    _log("offscreen 切换 popup 失败: %s" % e)
+
             # 查找密码框
             password_selectors = [
                 ('xpath', 'xpath://input[@data-testid="okd-input" and @type="password"]'),
