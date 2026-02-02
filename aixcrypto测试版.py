@@ -147,6 +147,59 @@ class OKXWallet:
                     time.sleep(2)
 
                 if not retry_loaded:
+                    _log("扩展页面文本为空，尝试使用 JS 查找密码框...")
+                    try:
+                        js_ok = unlock_tab.run_js("""
+                        (function(pwd){
+                          function findIn(root){
+                            if(!root) return null;
+                            try{
+                              var el = root.querySelector('input[type="password"]');
+                              if(el) return el;
+                              var all = root.querySelectorAll('*');
+                              for (var i=0;i<all.length;i++){
+                                var n = all[i];
+                                if(n && n.shadowRoot){
+                                  var found = findIn(n.shadowRoot);
+                                  if(found) return found;
+                                }
+                              }
+                            }catch(e){}
+                            return null;
+                          }
+                          var input = findIn(document);
+                          if(!input) return false;
+                          try{
+                            input.focus();
+                            input.value = pwd;
+                            input.dispatchEvent(new Event('input', {bubbles:true}));
+                            input.dispatchEvent(new Event('change', {bubbles:true}));
+                          }catch(e){}
+                          var btn = document.querySelector('button[data-testid="okd-button"][type="submit"]') ||
+                                    document.querySelector('button[type="submit"]');
+                          if(btn){
+                            try{ btn.click(); }catch(e){}
+                          }
+                          return true;
+                        })(arguments[0]);
+                        """, password)
+                    except Exception as e:
+                        js_ok = False
+                        _log("JS 查找密码框异常: %s" % e)
+
+                    if js_ok:
+                        _log("JS 已尝试填写密码并点击解锁，等待结果...")
+                        time.sleep(2)
+                        try:
+                            still_locked = unlock_tab.run_js("return !!document.querySelector('input[type=\"password\"]')")
+                        except Exception:
+                            still_locked = False
+                        if not still_locked:
+                            _log("JS 解锁成功（密码框已消失）")
+                            return True
+                        _log("JS 解锁后密码框仍存在，判定未解锁。")
+                        return False
+
                     _log("【失败】扩展页面文本为空，判定未解锁（可能未加载完成或页面异常）。")
                     return False
 
@@ -210,7 +263,7 @@ class OKXWallet:
             return False
 
 # 版本号（用于自动更新比较）
-__version__ = "2026.02.05"
+__version__ = "2026.02.06"
 
 # 全局API地址参数
 ADSPOWER_API_BASE_URL = "http://127.0.0.1:50325"
