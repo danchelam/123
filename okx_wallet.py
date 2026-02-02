@@ -70,9 +70,25 @@ class OKXWallet:
                 print(f"第 {attempt + 1} 次未找到密码框，等待后重试...")
 
             if not password_input:
-                # 必须找到密码框才继续，不采用「未找到就视为已解锁」避免误判导致后续卡死
-                print("【解锁失败】未找到密码输入框。可能原因：该电脑扩展加载慢、选错标签页或扩展版本不同。请检查此电脑上的 OKX 扩展与页面。")
-                return False
+                # 未找到密码框：可能是扩展未加载，也可能是已经解锁
+                current_url = getattr(unlock_tab, "url", "") or ""
+                if not current_url.startswith("chrome-extension://"):
+                    print("【解锁失败】未进入 OKX 扩展页面（当前非 chrome-extension://），请检查扩展是否安装/是否被策略禁用。")
+                    return False
+
+                try:
+                    page_text = unlock_tab.ele("tag:body", timeout=3).text or ""
+                except Exception:
+                    page_text = ""
+
+                blocked_keywords = ("ERR_BLOCKED_BY_CLIENT", "This site can’t be reached", "无法访问此网站", "ERR_FAILED")
+                if any(k in page_text for k in blocked_keywords):
+                    print("【解锁失败】OKX 扩展页面加载失败（疑似被阻止或扩展不可用）。")
+                    return False
+
+                # 未找到密码框但确实在扩展页，按“已解锁”处理（避免已解锁时误判失败）
+                print("未找到密码框，但已进入 OKX 扩展页面，判定为“已解锁”。")
+                return True
 
             # 确保焦点在输入框后输入，并仅在确认输入+点击解锁成功后才返回 True
             print("已找到密码输入框，正在输入密码并点击解锁...")
