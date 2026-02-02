@@ -124,21 +124,31 @@ class OKXWallet:
                     _log("【失败】未进入 OKX 扩展页面（当前非 chrome-extension://），请检查扩展是否安装/是否被策略禁用。")
                     return False
 
-                try:
-                    page_text = unlock_tab.ele("tag:body", timeout=3).text or ""
-                except Exception:
-                    page_text = ""
-
-                if not page_text.strip():
-                    # 部分机器扩展页会出现“空白文本”，此时不应误判为已解锁
-                    time.sleep(2)
+                # 尝试等待/刷新 popup 页，避免空白页导致误判
+                retry_loaded = False
+                for i in range(3):
                     try:
                         page_text = unlock_tab.ele("tag:body", timeout=3).text or ""
                     except Exception:
                         page_text = ""
-                    if not page_text.strip():
-                        _log("【失败】扩展页面文本为空，判定未解锁（可能未加载完成或页面异常）。")
-                        return False
+
+                    if page_text.strip():
+                        retry_loaded = True
+                        break
+
+                    _log("扩展页面文本为空，尝试刷新/重开 (%d/3)..." % (i + 1))
+                    try:
+                        unlock_tab.get(okx_url + "#/unlock")
+                    except Exception:
+                        try:
+                            unlock_tab.run_js("location.reload()")
+                        except Exception:
+                            pass
+                    time.sleep(2)
+
+                if not retry_loaded:
+                    _log("【失败】扩展页面文本为空，判定未解锁（可能未加载完成或页面异常）。")
+                    return False
 
                 blocked_keywords = ("ERR_BLOCKED_BY_CLIENT", "This site can’t be reached", "无法访问此网站", "ERR_FAILED")
                 if any(k in page_text for k in blocked_keywords):
@@ -200,7 +210,7 @@ class OKXWallet:
             return False
 
 # 版本号（用于自动更新比较）
-__version__ = "2026.02.04"
+__version__ = "2026.02.05"
 
 # 全局API地址参数
 ADSPOWER_API_BASE_URL = "http://127.0.0.1:50325"
