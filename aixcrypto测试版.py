@@ -351,7 +351,7 @@ class OKXWallet:
             return False
 
 # 版本号（用于自动更新比较）
-__version__ = "2026.02.10.11"
+__version__ = "2026.02.10.12"
 
 # 全局API地址参数
 ADSPOWER_API_BASE_URL = "http://127.0.0.1:50325"
@@ -1276,7 +1276,7 @@ def _check_network_error(page: ChromiumPage, account_id: str) -> bool:
         # log(account_id, f"检查网络错误异常: {e}")
         return False
 
-def _wait_for_place_open_and_click(page: ChromiumPage, target_url: str, main_tab_id: str, account_id: str, max_clicks: Optional[int] = None, max_total_seconds: int = 900) -> bool:
+def _wait_for_place_open_and_click(page: ChromiumPage, target_url: str, main_tab_id: str, account_id: str, max_clicks: Optional[int] = None, max_total_seconds: int = 360) -> bool:
     """
     新策略（低刷新、低干扰）：
     1) 先判断市场状态 Live / Offline
