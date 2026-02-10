@@ -351,7 +351,7 @@ class OKXWallet:
             return False
 
 # 版本号（用于自动更新比较）
-__version__ = "2026.02.10.12"
+__version__ = "2026.02.11"
 
 # 全局API地址参数
 ADSPOWER_API_BASE_URL = "http://127.0.0.1:50325"
@@ -1337,6 +1337,40 @@ def _wait_for_place_open_and_click(page: ChromiumPage, target_url: str, main_tab
 
             time.sleep(1)
 
+    def _drain_wallet_popups(tag: str, rounds: int = 8, interval: float = 0.35) -> bool:
+        """
+        深度清理钱包签名/确认弹窗。
+        主要用于第一笔下注前后，处理历史签名和新触发签名。
+        """
+        log(account_id, f"{tag}：开始清理钱包签名/确认弹窗...")
+        for _ in range(rounds):
+            if STOP_FLAG:
+                return False
+            try:
+                _check_and_handle_popups(page, main_tab_id, account_id)
+            except Exception:
+                pass
+
+            # 有些签名会在点击后延迟打开新标签页，这里快速被动捕捉一次
+            try:
+                new_tab_id = page.wait.new_tab(timeout=0.2)
+                if new_tab_id:
+                    try:
+                        page.activate_tab(new_tab_id)
+                    except Exception:
+                        pass
+                    try:
+                        tab = page.get_tab(new_tab_id)
+                        if tab:
+                            _attempt_confirm_in_tab(tab, account_id)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            time.sleep(interval)
+        log(account_id, f"{tag}：弹窗清理完成。")
+        return True
+
     clicks = 0
     last_progress = time.time()
     stage = "wait_open"
@@ -1345,6 +1379,8 @@ def _wait_for_place_open_and_click(page: ChromiumPage, target_url: str, main_tab
     round_remaining_before_click = None
     seen_success_in_round = False
     next_popup_check_at = 0.0
+    first_bet_pre_cleanup_done = False
+    first_bet_post_cleanup_done = False
 
     while True:
         if STOP_FLAG:
@@ -1411,6 +1447,12 @@ def _wait_for_place_open_and_click(page: ChromiumPage, target_url: str, main_tab
             if stage == "wait_open":
                 # Live + Placing Open 才尝试点击
                 if market_status == "live" and placing_open:
+                    # 第一笔下注前先深度清理一次历史签名弹窗
+                    if clicks == 0 and not first_bet_pre_cleanup_done:
+                        if not _drain_wallet_popups("第一笔下注前"):
+                            return False
+                        first_bet_pre_cleanup_done = True
+
                     log(account_id, "市场 Live 且检测到 Placing Open，随机点击 Long/Short。")
                     choice = random.choice(["long", "short"])
                     clicked = False
@@ -1443,6 +1485,11 @@ def _wait_for_place_open_and_click(page: ChromiumPage, target_url: str, main_tab
                     if clicked:
                         clicks += 1
                         last_progress = time.time()
+                        # 第一笔点击后再清理一次，处理刚触发的签名请求
+                        if clicks == 1 and not first_bet_post_cleanup_done:
+                            if not _drain_wallet_popups("第一笔下注后"):
+                                return False
+                            first_bet_post_cleanup_done = True
                         stage = "wait_result"
                         stage_start = time.time()
                         round_remaining_before_click = remaining
