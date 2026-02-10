@@ -351,7 +351,7 @@ class OKXWallet:
             return False
 
 # 版本号（用于自动更新比较）
-__version__ = "2026.02.10.10"
+__version__ = "2026.02.10.11"
 
 # 全局API地址参数
 ADSPOWER_API_BASE_URL = "http://127.0.0.1:50325"
@@ -1342,7 +1342,8 @@ def _wait_for_place_open_and_click(page: ChromiumPage, target_url: str, main_tab
     stage = "wait_open"
     stage_start = time.time()
     none_count = 0
-    retry_click_count = 0
+    round_remaining_before_click = None
+    seen_success_in_round = False
     next_popup_check_at = 0.0
 
     while True:
@@ -1370,7 +1371,8 @@ def _wait_for_place_open_and_click(page: ChromiumPage, target_url: str, main_tab
             last_progress = time.time()
             stage = "wait_open"
             stage_start = time.time()
-            retry_click_count = 0
+            round_remaining_before_click = None
+            seen_success_in_round = False
             continue
 
         try:
@@ -1441,79 +1443,57 @@ def _wait_for_place_open_and_click(page: ChromiumPage, target_url: str, main_tab
                     if clicked:
                         clicks += 1
                         last_progress = time.time()
-                        stage = "wait_success"
+                        stage = "wait_result"
                         stage_start = time.time()
-                        retry_click_count = 0
+                        round_remaining_before_click = remaining
+                        seen_success_in_round = False
+                        log(account_id, "已点击，直接等待本轮结果（胜负/次数变化）。")
                         time.sleep(0.2)
                         continue
 
-            elif stage == "wait_success":
-                # 点击后等待 success；有时会直接出结果
-                if success:
-                    log(account_id, "检测到 Place Success!，等待本轮结果...")
-                    last_progress = time.time()
-                    stage = "wait_result"
-                    stage_start = time.time()
-                    continue
-
-                if won or lost:
-                    result_text = "You Won!" if won else "You Lost"
-                    log(account_id, f"检测到本轮结果: {result_text}，继续下一轮。")
-                    last_progress = time.time()
-                    stage = "wait_open"
-                    stage_start = time.time()
-                    continue
-
-                # 若还在开盘且 success 未出现，允许小次数重试点击，不做刷新
-                if placing_open and time.time() - stage_start > 6 and retry_click_count < 2:
-                    retry_click_count += 1
-                    log(account_id, f"等待 Success 中，执行第 {retry_click_count} 次补点。")
-                    choice = random.choice(["long", "short"])
-                    if choice == "long":
-                        _try_detect_and_click(
-                            page,
-                            "xpath://div[contains(normalize-space(),'Place Long')]",
-                            account_id=account_id,
-                            timeout=3,
-                        )
-                    else:
-                        _try_detect_and_click(
-                            page,
-                            "xpath://div[contains(normalize-space(),'Place Short')]",
-                            account_id=account_id,
-                            timeout=3,
-                        )
-                    last_progress = time.time()
-                    stage_start = time.time()
-                    continue
-
-                if time.time() - stage_start > 30:
-                    log(account_id, "等待 Place Success 超时，重置到下一轮等待。")
-                    stage = "wait_open"
-                    stage_start = time.time()
-                    continue
-
             elif stage == "wait_result":
+                # Success 仅做辅助日志，不作为硬条件
+                if success and not seen_success_in_round:
+                    seen_success_in_round = True
+                    log(account_id, "检测到 Place Success!，继续等待胜负结果。")
+                    last_progress = time.time()
+
                 if won or lost:
                     result_text = "You Won!" if won else "You Lost"
                     log(account_id, f"本轮结果: {result_text}，继续下一轮。")
                     last_progress = time.time()
                     stage = "wait_open"
                     stage_start = time.time()
+                    round_remaining_before_click = None
+                    seen_success_in_round = False
+                    continue
+
+                # 胜负文案偶发缺失时，用“剩余次数下降”判定本轮完成
+                if round_remaining_before_click is not None and remaining < round_remaining_before_click:
+                    log(account_id, f"检测到剩余次数下降 {round_remaining_before_click}->{remaining}，视为本轮完成，继续下一轮。")
+                    last_progress = time.time()
+                    stage = "wait_open"
+                    stage_start = time.time()
+                    round_remaining_before_click = None
+                    seen_success_in_round = False
                     continue
 
                 # 某些情况下结果文案不出现，但界面已回到开盘，视为本轮已结束
-                if placing_open and time.time() - stage_start > 8:
+                if placing_open and time.time() - stage_start > 4:
                     log(account_id, "结果文案未出现但已重新开盘，视为本轮结束，继续下一轮。")
                     last_progress = time.time()
                     stage = "wait_open"
                     stage_start = time.time()
+                    round_remaining_before_click = None
+                    seen_success_in_round = False
                     continue
 
-                if time.time() - stage_start > 90:
+                if time.time() - stage_start > 40:
                     log(account_id, "等待本轮结果超时，重置到下一轮等待。")
                     stage = "wait_open"
                     stage_start = time.time()
+                    round_remaining_before_click = None
+                    seen_success_in_round = False
                     continue
 
             if PERF_DEBUG:
