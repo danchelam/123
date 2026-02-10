@@ -351,7 +351,7 @@ class OKXWallet:
             return False
 
 # 版本号（用于自动更新比较）
-__version__ = "2026.02.10.7"
+__version__ = "2026.02.10.8"
 
 # 全局API地址参数
 ADSPOWER_API_BASE_URL = "http://127.0.0.1:50325"
@@ -373,6 +373,8 @@ file_lock = threading.Lock()
 STOP_FLAG = False
 # 日志回调函数 (用于Web端推送)
 logger_callback = None
+# 性能调试开关（默认关闭，可通过环境变量 AIX_PERF_DEBUG=1 开启）
+PERF_DEBUG = str(os.environ.get("AIX_PERF_DEBUG", "")).strip().lower() in ("1", "true", "yes", "on")
 
 def set_logger_callback(callback):
     global logger_callback
@@ -389,6 +391,20 @@ def log(account_id: str, msg: str):
             logger_callback(full_msg)
         except Exception:
             pass
+
+def set_perf_debug(enabled: bool):
+    """
+    运行时切换性能调试日志开关。
+    """
+    global PERF_DEBUG
+    PERF_DEBUG = bool(enabled)
+
+def perf_log(account_id: str, msg: str):
+    """
+    仅在开启 PERF_DEBUG 时输出性能调试日志。
+    """
+    if PERF_DEBUG:
+        log(account_id, f"[PERF] {msg}")
 
 def stop_all_tasks():
     global STOP_FLAG
@@ -1085,9 +1101,9 @@ def _get_remaining_clicks(page: ChromiumPage) -> Optional[int]:
     从按钮文本中提取剩余次数，如 'Place Long (94/100)' -> 94。
     """
     try:
-        ele = page.ele("xpath://div[contains(normalize-space(),'Place Long')]", timeout=1)
+        ele = page.ele("xpath://div[contains(normalize-space(),'Place Long')]", timeout=0.2)
         if not ele:
-            ele = page.ele("xpath://div[contains(normalize-space(),'Place Short')]", timeout=1)
+            ele = page.ele("xpath://div[contains(normalize-space(),'Place Short')]", timeout=0.2)
         if not ele:
             return None
         text = ele.text
@@ -1106,7 +1122,7 @@ def _is_countdown_state(page: ChromiumPage) -> bool:
     判断是否进入倒计时状态，如 '100 chances in 06:30:15'。
     """
     try:
-        ele = page.ele("xpath://div[contains(normalize-space(),'chances in')]", timeout=1)
+        ele = page.ele("xpath://div[contains(normalize-space(),'chances in')]", timeout=0.2)
         return bool(ele)
     except Exception:
         return False
@@ -1271,7 +1287,9 @@ def _wait_for_place_open_and_click(page: ChromiumPage, target_url: str, main_tab
     last_remaining = None
     remaining = max_clicks
     next_network_check_at = 0.0
+    next_popup_check_at = 0.0
     placing_open_zero_since = None
+    perf_last_log_at = 0.0
     
     stage = "wait_settling" # 默认为等待结算，后续根据实际情况跳转
 
@@ -1284,6 +1302,25 @@ def _wait_for_place_open_and_click(page: ChromiumPage, target_url: str, main_tab
             )
         except Exception:
             return False
+
+    def _perf_tick(stage_name: str, loop_start_ts: float, extra: str = ""):
+        """
+        性能日志节流：每秒最多打印一次，避免日志洪泛。
+        """
+        nonlocal perf_last_log_at
+        if not PERF_DEBUG:
+            return
+        now = time.time()
+        if now - perf_last_log_at < 1.0:
+            return
+        loop_cost_ms = int((now - loop_start_ts) * 1000)
+        suffix = f", {extra}" if extra else ""
+        perf_log(
+            account_id,
+            f"stage={stage_name}, loop_cost={loop_cost_ms}ms, "
+            f"since_progress={int(now - last_progress)}s{suffix}",
+        )
+        perf_last_log_at = now
 
     # ================= 阶段一：首次点击与确认（含刷新重试逻辑） =================
     # 使用外层循环包裹，以便在遇到 "Already placed" 时刷新并从头重试首次点击逻辑
@@ -1309,8 +1346,12 @@ def _wait_for_place_open_and_click(page: ChromiumPage, target_url: str, main_tab
         phase1_clicked = False
         
         while True:
-            # 检查弹窗
-            _check_and_handle_popups(page, main_tab_id, account_id)
+            loop_begin = time.time()
+            # 检查弹窗（节流，避免每轮扫描全部标签页导致卡顿）
+            now_ts = time.time()
+            if now_ts >= next_popup_check_at:
+                _check_and_handle_popups(page, main_tab_id, account_id)
+                next_popup_check_at = now_ts + 0.3
             if STOP_FLAG: return False
             if time.time() - last_progress > max_total_seconds:
                 log(account_id, f"超时({max_total_seconds}s)，退出。")
@@ -1337,7 +1378,7 @@ def _wait_for_place_open_and_click(page: ChromiumPage, target_url: str, main_tab
 
             placing_open = page.ele(
                 "t:div@@class=flex items-center gap-2 text-xs capitalize text-emerald-400@@tx():Placing Open",
-                timeout=1,
+                timeout=0.1,
             )
             if placing_open:
                 first_choice = random.choice(["long", "short"])
@@ -1380,6 +1421,7 @@ def _wait_for_place_open_and_click(page: ChromiumPage, target_url: str, main_tab
                 time.sleep(3)
                 continue # 刷新后重新 loop 寻找状态
 
+            _perf_tick("phase1_wait_open", loop_begin, f"placing_open={bool(placing_open)}")
             time.sleep(0.1)
 
         # 2. 等待点击生效 (Place Success! / Settling)
@@ -1394,8 +1436,12 @@ def _wait_for_place_open_and_click(page: ChromiumPage, target_url: str, main_tab
         refresh_retry_triggered = False
 
         while True:
-            # 检查弹窗
-            _check_and_handle_popups(page, main_tab_id, account_id)
+            loop_begin = time.time()
+            # 检查弹窗（节流）
+            now_ts = time.time()
+            if now_ts >= next_popup_check_at:
+                _check_and_handle_popups(page, main_tab_id, account_id)
+                next_popup_check_at = now_ts + 0.3
 
             if STOP_FLAG: return False
             if time.time() - last_progress > max_total_seconds:
@@ -1417,9 +1463,9 @@ def _wait_for_place_open_and_click(page: ChromiumPage, target_url: str, main_tab
                 
             success = page.ele(
                 "t:div@@class=text-white font-semibold text-base@@tx():Place Success!",
-                timeout=0.2,
+                timeout=0.08,
             )
-            settling = page.ele("xpath://div[contains(normalize-space(),'Settling')]", timeout=0.2)
+            settling = page.ele("xpath://div[contains(normalize-space(),'Settling')]", timeout=0.08)
             
             if success:
                 log(account_id, "检测到 Place Success!，开始等待 Settling...")
@@ -1448,7 +1494,7 @@ def _wait_for_place_open_and_click(page: ChromiumPage, target_url: str, main_tab
             # 重试点击逻辑 (如果 Placing Open 再次出现且长时间没成功)
             placing_open = page.ele(
                 "t:div@@class=flex items-center gap-2 text-xs capitalize text-emerald-400@@tx():Placing Open",
-                timeout=0.2,
+                timeout=0.08,
             )
             if placing_open and time.time() - initial_click_last_try > initial_click_timeout:
                 if initial_click_attempts < initial_click_max_attempts:
@@ -1471,6 +1517,11 @@ def _wait_for_place_open_and_click(page: ChromiumPage, target_url: str, main_tab
                     success_confirmed = True # 强制视为进入监控阶段
                     break
             
+            _perf_tick(
+                "phase2_wait_success_or_settling",
+                loop_begin,
+                f"success={bool(success)}, settling={bool(settling)}, placing_open={bool(placing_open)}",
+            )
             time.sleep(0.1)
         
         # 判断是否需要 break 外层循环
@@ -1484,8 +1535,12 @@ def _wait_for_place_open_and_click(page: ChromiumPage, target_url: str, main_tab
     # 继续沿用上一步的阶段（已设为 wait_settling 或 wait_next_open）
     none_count = 0
     while True:
-        # 检查弹窗
-        _check_and_handle_popups(page, main_tab_id, account_id)
+        loop_begin = time.time()
+        # 检查弹窗（节流）
+        now_ts = time.time()
+        if now_ts >= next_popup_check_at:
+            _check_and_handle_popups(page, main_tab_id, account_id)
+            next_popup_check_at = now_ts + 0.3
 
         if STOP_FLAG:
             log(account_id, "收到停止信号，停止监控。")
@@ -1531,12 +1586,12 @@ def _wait_for_place_open_and_click(page: ChromiumPage, target_url: str, main_tab
                 return True
             placing_open = page.ele(
                 "t:div@@class=flex items-center gap-2 text-xs capitalize text-emerald-400@@tx():Placing Open",
-                timeout=0.1,
+                timeout=0.05,
             )
-            settling = page.ele("xpath://div[contains(normalize-space(),'Settling')]", timeout=0.1)
+            settling = page.ele("xpath://div[contains(normalize-space(),'Settling')]", timeout=0.05)
             success = page.ele(
                 "t:div@@class=text-white font-semibold text-base@@tx():Place Success!",
-                timeout=0.1,
+                timeout=0.05,
             )
 
             if stage in ("wait_first_open", "wait_next_open"):
@@ -1609,6 +1664,11 @@ def _wait_for_place_open_and_click(page: ChromiumPage, target_url: str, main_tab
                     continue
                 else:
                     placing_open_zero_since = None
+                    _perf_tick(
+                        "wait_next_open",
+                        loop_begin,
+                        f"remaining={remaining}, placing_open={bool(placing_open)}, settling={bool(settling)}, success={bool(success)}",
+                    )
                     time.sleep(0.1)
                 continue
 
@@ -1643,6 +1703,11 @@ def _wait_for_place_open_and_click(page: ChromiumPage, target_url: str, main_tab
                     log(account_id, "等待 Place Success 超时，继续等待下一个 Placing Open...")
                     stage = "wait_next_open"
                     stage_start = time.time()
+                _perf_tick(
+                    "wait_success",
+                    loop_begin,
+                    f"remaining={remaining}, settling={bool(settling)}, success={bool(success)}",
+                )
                 time.sleep(0.05)
                 continue
 
@@ -1665,6 +1730,11 @@ def _wait_for_place_open_and_click(page: ChromiumPage, target_url: str, main_tab
                     time.sleep(3)
                     stage = "wait_next_open"
                     stage_start = time.time()
+                _perf_tick(
+                    "wait_settling",
+                    loop_begin,
+                    f"remaining={remaining}, settling={bool(settling)}",
+                )
                 time.sleep(0.05)
                 continue
 
@@ -1687,9 +1757,19 @@ def _wait_for_place_open_and_click(page: ChromiumPage, target_url: str, main_tab
                     time.sleep(3)
                     stage = "wait_next_open"
                     stage_start = time.time()
+                _perf_tick(
+                    "wait_settling_clear",
+                    loop_begin,
+                    f"remaining={remaining}, settling={bool(settling)}",
+                )
                 time.sleep(0.05)
                 continue
 
+            _perf_tick(
+                stage,
+                loop_begin,
+                f"remaining={remaining}, placing_open={bool(placing_open)}, settling={bool(settling)}, success={bool(success)}",
+            )
             time.sleep(0.2)
         except Exception as e:
             log(account_id, f"检测状态异常: {e}")
@@ -1800,6 +1880,8 @@ def run_account_task(
         return
 
     log(account_id, f"已连接窗口 ({addr})")
+    if PERF_DEBUG:
+        log(account_id, "性能调试日志已开启（AIX_PERF_DEBUG=1）。")
     try:
         page.get(url)
         log(account_id, f"已打开网址: {url}")
