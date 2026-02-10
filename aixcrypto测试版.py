@@ -351,7 +351,7 @@ class OKXWallet:
             return False
 
 # 版本号（用于自动更新比较）
-__version__ = "2026.02.10.9"
+__version__ = "2026.02.10.10"
 
 # 全局API地址参数
 ADSPOWER_API_BASE_URL = "http://127.0.0.1:50325"
@@ -1101,18 +1101,24 @@ def _get_remaining_clicks(page: ChromiumPage) -> Optional[int]:
     从按钮文本中提取剩余次数，如 'Place Long (94/100)' -> 94。
     """
     try:
-        ele = page.ele("xpath://div[contains(normalize-space(),'Place Long')]", timeout=0.2)
-        if not ele:
-            ele = page.ele("xpath://div[contains(normalize-space(),'Place Short')]", timeout=0.2)
-        if not ele:
-            return None
-        text = ele.text
-        # 解析括号里的数字
         import re
-        m = re.search(r"\((\d+)\s*/\s*\d+\)", text)
-        if not m:
+        values = []
+        # 同时读取 Long/Short，避免某个按钮文本滞后导致误判
+        long_eles = page.eles("xpath://div[contains(normalize-space(),'Place Long')]")
+        short_eles = page.eles("xpath://div[contains(normalize-space(),'Place Short')]")
+        for ele in (long_eles + short_eles):
+            try:
+                text = ele.text or ""
+            except Exception:
+                text = ""
+            m = re.search(r"\((\d+)\s*/\s*\d+\)", text)
+            if m:
+                values.append(int(m.group(1)))
+
+        if not values:
             return None
-        return int(m.group(1))
+        # 使用最小值更保守，避免读取到旧文本导致“已完成却不退出”
+        return min(values)
     except Exception:
         return None
 
@@ -1368,6 +1374,11 @@ def _wait_for_place_open_and_click(page: ChromiumPage, target_url: str, main_tab
             continue
 
         try:
+            # 进入倒计时代表本轮（本日）次数已结束，直接退出
+            if _is_countdown_state(page):
+                log(account_id, "检测到倒计时状态，结束监控。")
+                return True
+
             # 每轮读取剩余次数，避免按点击数误差
             remaining = _get_remaining_clicks(page)
             if remaining is None:
@@ -1486,6 +1497,14 @@ def _wait_for_place_open_and_click(page: ChromiumPage, target_url: str, main_tab
                 if won or lost:
                     result_text = "You Won!" if won else "You Lost"
                     log(account_id, f"本轮结果: {result_text}，继续下一轮。")
+                    last_progress = time.time()
+                    stage = "wait_open"
+                    stage_start = time.time()
+                    continue
+
+                # 某些情况下结果文案不出现，但界面已回到开盘，视为本轮已结束
+                if placing_open and time.time() - stage_start > 8:
+                    log(account_id, "结果文案未出现但已重新开盘，视为本轮结束，继续下一轮。")
                     last_progress = time.time()
                     stage = "wait_open"
                     stage_start = time.time()
