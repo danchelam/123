@@ -351,7 +351,7 @@ class OKXWallet:
             return False
 
 # 版本号（用于自动更新比较）
-__version__ = "2026.02.10.5"
+__version__ = "2026.02.106"
 
 # 全局API地址参数
 ADSPOWER_API_BASE_URL = "http://127.0.0.1:50325"
@@ -1270,8 +1270,20 @@ def _wait_for_place_open_and_click(page: ChromiumPage, target_url: str, main_tab
     last_progress = time.time()
     last_remaining = None
     remaining = max_clicks
+    next_network_check_at = 0.0
+    placing_open_zero_since = None
     
     stage = "wait_settling" # 默认为等待结算，后续根据实际情况跳转
+
+    def _is_zero_countdown() -> bool:
+        try:
+            # 尽量使用精确匹配，避免误命中页面其他隐藏文案
+            return bool(
+                page.ele("xpath://*[normalize-space()='00:00']", timeout=0.08)
+                or page.ele("xpath://div[normalize-space()='0s']", timeout=0.08)
+            )
+        except Exception:
+            return False
 
     # ================= 阶段一：首次点击与确认（含刷新重试逻辑） =================
     # 使用外层循环包裹，以便在遇到 "Already placed" 时刷新并从头重试首次点击逻辑
@@ -1284,10 +1296,13 @@ def _wait_for_place_open_and_click(page: ChromiumPage, target_url: str, main_tab
             log(account_id, f"长时间无进展，触发超时({max_total_seconds}s)，将结束该窗口。")
             return False
         
-        # [新增] 检查网络错误
-        if _check_network_error(page, account_id):
-            last_progress = time.time() # 重置超时计时
-            continue
+        # 网络错误检测做节流，避免每轮都读取整页导致反应变慢
+        now_ts = time.time()
+        if now_ts >= next_network_check_at:
+            next_network_check_at = now_ts + 2
+            if _check_network_error(page, account_id):
+                last_progress = time.time() # 重置超时计时
+                continue
 
         # 1. 等待 Placing Open 并点击 (或检测到已成功/倒计时)
         log(account_id, "准备寻找 Placing Open 并点击...")
@@ -1301,10 +1316,13 @@ def _wait_for_place_open_and_click(page: ChromiumPage, target_url: str, main_tab
                 log(account_id, f"超时({max_total_seconds}s)，退出。")
                 return False
             
-            # [新增] 检查网络错误
-            if _check_network_error(page, account_id):
-                last_progress = time.time()
-                break # 跳出内层循环，重新开始外层循环
+            # 网络错误检测做节流，避免频繁读取页面
+            now_ts = time.time()
+            if now_ts >= next_network_check_at:
+                next_network_check_at = now_ts + 2
+                if _check_network_error(page, account_id):
+                    last_progress = time.time()
+                    break # 跳出内层循环，重新开始外层循环
 
             if _is_countdown_state(page):
                 log(account_id, "检测到倒计时状态，结束监控。")
@@ -1384,11 +1402,14 @@ def _wait_for_place_open_and_click(page: ChromiumPage, target_url: str, main_tab
                 log(account_id, f"超时({max_total_seconds}s)，退出。")
                 return False
             
-            # [新增] 检查网络错误
-            if _check_network_error(page, account_id):
-                last_progress = time.time()
-                refresh_retry_triggered = True
-                break
+            # 网络错误检测做节流，避免频繁读取页面
+            now_ts = time.time()
+            if now_ts >= next_network_check_at:
+                next_network_check_at = now_ts + 2
+                if _check_network_error(page, account_id):
+                    last_progress = time.time()
+                    refresh_retry_triggered = True
+                    break
 
             if _is_countdown_state(page):
                 log(account_id, "检测到倒计时状态，结束监控。")
@@ -1473,12 +1494,16 @@ def _wait_for_place_open_and_click(page: ChromiumPage, target_url: str, main_tab
             log(account_id, f"长时间无进展，触发超时({max_total_seconds}s)，将结束该窗口。")
             return False
         
-        # [新增] 检查网络错误
-        if _check_network_error(page, account_id):
-            last_progress = time.time()
-            stage = "wait_next_open" # 刷新后假设从头开始检测
-            stage_start = time.time()
-            continue
+        # 网络错误检测做节流，避免频繁读取页面
+        now_ts = time.time()
+        if now_ts >= next_network_check_at:
+            next_network_check_at = now_ts + 2
+            if _check_network_error(page, account_id):
+                last_progress = time.time()
+                stage = "wait_next_open" # 刷新后假设从头开始检测
+                stage_start = time.time()
+                placing_open_zero_since = None
+                continue
 
         try:
             # 如果进入倒计时，表示次数已用完
@@ -1516,19 +1541,22 @@ def _wait_for_place_open_and_click(page: ChromiumPage, target_url: str, main_tab
 
             if stage in ("wait_first_open", "wait_next_open"):
                 if placing_open:
-                    # === [新增] 检查 Placing Open + 00:00 卡死 ===
-                    # 增加二次确认，防止碰巧遇到 00:00 的瞬间
-                    if page.ele("xpath://*[contains(text(), '00:00')]", timeout=0.1) or page.ele("xpath://div[contains(normalize-space(), '0s')]", timeout=0.1):
-                        time.sleep(10)
-                        # 再次检查，如果还是 00:00 且状态仍为 Placing Open，才判定卡死
-                        if (page.ele("xpath://*[contains(text(), '00:00')]", timeout=0.1) or page.ele("xpath://div[contains(normalize-space(), '0s')]", timeout=0.1)) and \
-                           page.ele("t:div@@class=flex items-center gap-2 text-xs capitalize text-emerald-400@@tx():Placing Open", timeout=0.1):
-                            log(account_id, "检测到 Placing Open 且长时间(>10s)倒计时为 00:00，判定为卡死，刷新页面...")
+                    # 只有进入 00:00 后才开始计时，连续超过 10 秒才判定卡死
+                    if _is_zero_countdown():
+                        if placing_open_zero_since is None:
+                            placing_open_zero_since = time.time()
+                        elif time.time() - placing_open_zero_since >= 10:
+                            log(account_id, "检测到 Placing Open 且 00:00 持续超过10s，判定为卡死，刷新页面...")
                             page.refresh()
                             time.sleep(3)
                             stage = "wait_next_open"
                             stage_start = time.time()
+                            placing_open_zero_since = None
                             continue
+                        time.sleep(0.1)
+                        continue
+                    else:
+                        placing_open_zero_since = None
 
                     log(account_id, "检测到 Placing Open，随机点击 Long/Short。")
                     choice = random.choice(["long", "short"])
@@ -1571,14 +1599,16 @@ def _wait_for_place_open_and_click(page: ChromiumPage, target_url: str, main_tab
                     stage = "wait_success"
                     stage_start = time.time()
                 # === [新增] 检查 00:00 卡死 ===
-                elif time.time() - stage_start > 10 and (page.ele("xpath://*[contains(text(), '00:00')]", timeout=0.1) or page.ele("xpath://div[contains(normalize-space(), '0s')]", timeout=0.1)):
+                elif time.time() - stage_start > 10 and _is_zero_countdown():
                     log(account_id, "在等待开盘阶段检测到倒计时归零但未开盘，刷新页面...")
                     page.refresh()
                     time.sleep(3)
                     stage = "wait_next_open"
                     stage_start = time.time()
+                    placing_open_zero_since = None
                     continue
                 else:
+                    placing_open_zero_since = None
                     time.sleep(0.1)
                 continue
 
@@ -1602,7 +1632,7 @@ def _wait_for_place_open_and_click(page: ChromiumPage, target_url: str, main_tab
                     stage_start = time.time()
                     continue
                 # === [新增] 检查 00:00 卡死 (在等待 Success 期间) ===
-                elif time.time() - stage_start > 10 and (page.ele("xpath://*[contains(text(), '00:00')]", timeout=0.1) or page.ele("xpath://div[contains(normalize-space(), '0s')]", timeout=0.1)):
+                elif time.time() - stage_start > 10 and _is_zero_countdown():
                     log(account_id, "在等待 Success 阶段检测到倒计时归零，刷新页面...")
                     page.refresh()
                     time.sleep(3)
@@ -1622,7 +1652,7 @@ def _wait_for_place_open_and_click(page: ChromiumPage, target_url: str, main_tab
                     stage = "wait_settling_clear"
                     stage_start = time.time()
                 # === [新增] 检查 00:00 卡死 ===
-                elif time.time() - stage_start > 10 and (page.ele("xpath://*[contains(text(), '00:00')]", timeout=0.1) or page.ele("xpath://div[contains(normalize-space(), '0s')]", timeout=0.1)):
+                elif time.time() - stage_start > 10 and _is_zero_countdown():
                     log(account_id, "在 Settling 阶段检测到倒计时归零但状态未变，刷新页面...")
                     page.refresh()
                     time.sleep(3)
@@ -1644,7 +1674,7 @@ def _wait_for_place_open_and_click(page: ChromiumPage, target_url: str, main_tab
                     stage = "wait_next_open"
                     stage_start = time.time()
                 # === [新增] 检查 00:00 卡死 ===
-                elif time.time() - stage_start > 10 and (page.ele("xpath://*[contains(text(), '00:00')]", timeout=0.1) or page.ele("xpath://div[contains(normalize-space(), '0s')]", timeout=0.1)):
+                elif time.time() - stage_start > 10 and _is_zero_countdown():
                     log(account_id, "在 Settling Clear 阶段检测到倒计时归零但状态未变，刷新页面...")
                     page.refresh()
                     time.sleep(3)
