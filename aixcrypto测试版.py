@@ -351,7 +351,7 @@ class OKXWallet:
             return False
 
 # 版本号（用于自动更新比较）
-__version__ = "2026.02.106"
+__version__ = "2026.02.10.7"
 
 # 全局API地址参数
 ADSPOWER_API_BASE_URL = "http://127.0.0.1:50325"
@@ -1545,8 +1545,8 @@ def _wait_for_place_open_and_click(page: ChromiumPage, target_url: str, main_tab
                     if _is_zero_countdown():
                         if placing_open_zero_since is None:
                             placing_open_zero_since = time.time()
-                        elif time.time() - placing_open_zero_since >= 10:
-                            log(account_id, "检测到 Placing Open 且 00:00 持续超过10s，判定为卡死，刷新页面...")
+                        elif time.time() - placing_open_zero_since >= 30:
+                            log(account_id, "检测到 Placing Open 且 00:00 持续超过30s，判定为卡死，刷新页面...")
                             page.refresh()
                             time.sleep(3)
                             stage = "wait_next_open"
@@ -1599,7 +1599,7 @@ def _wait_for_place_open_and_click(page: ChromiumPage, target_url: str, main_tab
                     stage = "wait_success"
                     stage_start = time.time()
                 # === [新增] 检查 00:00 卡死 ===
-                elif time.time() - stage_start > 10 and _is_zero_countdown():
+                elif time.time() - stage_start > 30 and _is_zero_countdown():
                     log(account_id, "在等待开盘阶段检测到倒计时归零但未开盘，刷新页面...")
                     page.refresh()
                     time.sleep(3)
@@ -1632,7 +1632,7 @@ def _wait_for_place_open_and_click(page: ChromiumPage, target_url: str, main_tab
                     stage_start = time.time()
                     continue
                 # === [新增] 检查 00:00 卡死 (在等待 Success 期间) ===
-                elif time.time() - stage_start > 10 and _is_zero_countdown():
+                elif time.time() - stage_start > 30 and _is_zero_countdown():
                     log(account_id, "在等待 Success 阶段检测到倒计时归零，刷新页面...")
                     page.refresh()
                     time.sleep(3)
@@ -1652,7 +1652,7 @@ def _wait_for_place_open_and_click(page: ChromiumPage, target_url: str, main_tab
                     stage = "wait_settling_clear"
                     stage_start = time.time()
                 # === [新增] 检查 00:00 卡死 ===
-                elif time.time() - stage_start > 10 and _is_zero_countdown():
+                elif time.time() - stage_start > 30 and _is_zero_countdown():
                     log(account_id, "在 Settling 阶段检测到倒计时归零但状态未变，刷新页面...")
                     page.refresh()
                     time.sleep(3)
@@ -1674,7 +1674,7 @@ def _wait_for_place_open_and_click(page: ChromiumPage, target_url: str, main_tab
                     stage = "wait_next_open"
                     stage_start = time.time()
                 # === [新增] 检查 00:00 卡死 ===
-                elif time.time() - stage_start > 10 and _is_zero_countdown():
+                elif time.time() - stage_start > 30 and _is_zero_countdown():
                     log(account_id, "在 Settling Clear 阶段检测到倒计时归零但状态未变，刷新页面...")
                     page.refresh()
                     time.sleep(3)
