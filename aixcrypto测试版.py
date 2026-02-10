@@ -351,7 +351,7 @@ class OKXWallet:
             return False
 
 # 版本号（用于自动更新比较）
-__version__ = "2026.2.10.1"
+__version__ = "2026"
 
 # 全局API地址参数
 ADSPOWER_API_BASE_URL = "http://127.0.0.1:50325"
@@ -1449,6 +1449,20 @@ def _wait_for_place_open_and_click(page: ChromiumPage, target_url: str, main_tab
 
             if stage in ("wait_first_open", "wait_next_open"):
                 if placing_open:
+                    # === [新增] 检查 Placing Open + 00:00 卡死 ===
+                    # 增加二次确认，防止碰巧遇到 00:00 的瞬间
+                    if page.ele("xpath://*[contains(text(), '00:00')]", timeout=0.1) or page.ele("xpath://div[contains(normalize-space(), '0s')]", timeout=0.1):
+                        time.sleep(3)
+                        # 再次检查，如果还是 00:00 且状态仍为 Placing Open，才判定卡死
+                        if (page.ele("xpath://*[contains(text(), '00:00')]", timeout=0.1) or page.ele("xpath://div[contains(normalize-space(), '0s')]", timeout=0.1)) and \
+                           page.ele("t:div@@class=flex items-center gap-2 text-xs capitalize text-emerald-400@@tx():Placing Open", timeout=0.1):
+                            log(account_id, "检测到 Placing Open 且长时间(>3s)倒计时为 00:00，判定为卡死，刷新页面...")
+                            page.refresh()
+                            time.sleep(3)
+                            stage = "wait_next_open"
+                            stage_start = time.time()
+                            continue
+
                     log(account_id, "检测到 Placing Open，随机点击 Long/Short。")
                     choice = random.choice(["long", "short"])
                     if choice == "long":
@@ -1520,6 +1534,14 @@ def _wait_for_place_open_and_click(page: ChromiumPage, target_url: str, main_tab
                     stage = "wait_next_open" 
                     stage_start = time.time()
                     continue
+                # === [新增] 检查 00:00 卡死 (在等待 Success 期间) ===
+                elif time.time() - stage_start > 8 and (page.ele("xpath://*[contains(text(), '00:00')]", timeout=0.1) or page.ele("xpath://div[contains(normalize-space(), '0s')]", timeout=0.1)):
+                    log(account_id, "在等待 Success 阶段检测到倒计时归零，刷新页面...")
+                    page.refresh()
+                    time.sleep(3)
+                    stage = "wait_next_open"
+                    stage_start = time.time()
+                    continue
                 elif time.time() - stage_start > 60:
                     log(account_id, "等待 Place Success 超时，继续等待下一个 Placing Open...")
                     stage = "wait_next_open"
@@ -1533,7 +1555,7 @@ def _wait_for_place_open_and_click(page: ChromiumPage, target_url: str, main_tab
                     stage = "wait_settling_clear"
                     stage_start = time.time()
                 # === [新增] 检查 00:00 卡死 ===
-                elif time.time() - stage_start > 5 and (page.ele("xpath://*[contains(text(), '00:00')]", timeout=0.1) or page.ele("xpath://div[contains(normalize-space(), '0s')]", timeout=0.1)):
+                elif time.time() - stage_start > 10 and (page.ele("xpath://*[contains(text(), '00:00')]", timeout=0.1) or page.ele("xpath://div[contains(normalize-space(), '0s')]", timeout=0.1)):
                     log(account_id, "在 Settling 阶段检测到倒计时归零但状态未变，刷新页面...")
                     page.refresh()
                     time.sleep(3)
@@ -1555,7 +1577,7 @@ def _wait_for_place_open_and_click(page: ChromiumPage, target_url: str, main_tab
                     stage = "wait_next_open"
                     stage_start = time.time()
                 # === [新增] 检查 00:00 卡死 ===
-                elif time.time() - stage_start > 5 and (page.ele("xpath://*[contains(text(), '00:00')]", timeout=0.1) or page.ele("xpath://div[contains(normalize-space(), '0s')]", timeout=0.1)):
+                elif time.time() - stage_start > 20 and (page.ele("xpath://*[contains(text(), '00:00')]", timeout=0.1) or page.ele("xpath://div[contains(normalize-space(), '0s')]", timeout=0.1)):
                     log(account_id, "在 Settling Clear 阶段检测到倒计时归零但状态未变，刷新页面...")
                     page.refresh()
                     time.sleep(3)
