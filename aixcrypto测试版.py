@@ -351,7 +351,7 @@ class OKXWallet:
             return False
 
 # 版本号（用于自动更新比较）
-__version__ = "2026.2.10"
+__version__ = "2026.2.10.1"
 
 # 全局API地址参数
 ADSPOWER_API_BASE_URL = "http://127.0.0.1:50325"
@@ -1489,6 +1489,14 @@ def _wait_for_place_open_and_click(page: ChromiumPage, target_url: str, main_tab
                     log(account_id, f"已点击次数: {clicks}，剩余可点击: {remaining_after}")
                     stage = "wait_success"
                     stage_start = time.time()
+                # === [新增] 检查 00:00 卡死 ===
+                elif time.time() - stage_start > 10 and (page.ele("xpath://*[contains(text(), '00:00')]", timeout=0.1) or page.ele("xpath://div[contains(normalize-space(), '0s')]", timeout=0.1)):
+                    log(account_id, "在等待开盘阶段检测到倒计时归零但未开盘，刷新页面...")
+                    page.refresh()
+                    time.sleep(3)
+                    stage = "wait_next_open"
+                    stage_start = time.time()
+                    continue
                 else:
                     time.sleep(0.1)
                 continue
@@ -1524,8 +1532,18 @@ def _wait_for_place_open_and_click(page: ChromiumPage, target_url: str, main_tab
                     # log(account_id, "检测到 Settling，等待 Settling 结束...")
                     stage = "wait_settling_clear"
                     stage_start = time.time()
-                elif time.time() - stage_start > 60:
-                    log(account_id, "等待 Settling 超时，继续等待下一个 Placing Open...")
+                # === [新增] 检查 00:00 卡死 ===
+                elif time.time() - stage_start > 5 and (page.ele("xpath://*[contains(text(), '00:00')]", timeout=0.1) or page.ele("xpath://div[contains(normalize-space(), '0s')]", timeout=0.1)):
+                    log(account_id, "在 Settling 阶段检测到倒计时归零但状态未变，刷新页面...")
+                    page.refresh()
+                    time.sleep(3)
+                    stage = "wait_next_open"
+                    stage_start = time.time()
+                    continue
+                elif time.time() - stage_start > 30:
+                    log(account_id, "等待 Settling 超时(30s)，刷新页面...")
+                    page.refresh()
+                    time.sleep(3)
                     stage = "wait_next_open"
                     stage_start = time.time()
                 time.sleep(0.05)
@@ -1536,8 +1554,18 @@ def _wait_for_place_open_and_click(page: ChromiumPage, target_url: str, main_tab
                     log(account_id, "Settling 已结束，等待下一个 Placing Open...")
                     stage = "wait_next_open"
                     stage_start = time.time()
-                elif time.time() - stage_start > 60:
-                    log(account_id, "Settling 结束等待超时，继续等待下一个 Placing Open...")
+                # === [新增] 检查 00:00 卡死 ===
+                elif time.time() - stage_start > 5 and (page.ele("xpath://*[contains(text(), '00:00')]", timeout=0.1) or page.ele("xpath://div[contains(normalize-space(), '0s')]", timeout=0.1)):
+                    log(account_id, "在 Settling Clear 阶段检测到倒计时归零但状态未变，刷新页面...")
+                    page.refresh()
+                    time.sleep(3)
+                    stage = "wait_next_open"
+                    stage_start = time.time()
+                    continue
+                elif time.time() - stage_start > 30:
+                    log(account_id, "Settling 结束等待超时(30s)，刷新页面...")
+                    page.refresh()
+                    time.sleep(3)
                     stage = "wait_next_open"
                     stage_start = time.time()
                 time.sleep(0.05)
