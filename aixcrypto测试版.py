@@ -351,7 +351,7 @@ class OKXWallet:
             return False
 
 # 版本号（用于自动更新比较）
-__version__ = "2026.02.10.8"
+__version__ = "2026.02.10.9"
 
 # 全局API地址参数
 ADSPOWER_API_BASE_URL = "http://127.0.0.1:50325"
@@ -373,8 +373,8 @@ file_lock = threading.Lock()
 STOP_FLAG = False
 # 日志回调函数 (用于Web端推送)
 logger_callback = None
-# 性能调试开关（默认关闭，可通过环境变量 AIX_PERF_DEBUG=1 开启）
-PERF_DEBUG = str(os.environ.get("AIX_PERF_DEBUG", "")).strip().lower() in ("1", "true", "yes", "on")
+# 性能调试开关（默认开启；可通过环境变量 AIX_PERF_DEBUG=0 关闭）
+PERF_DEBUG = str(os.environ.get("AIX_PERF_DEBUG", "1")).strip().lower() in ("1", "true", "yes", "on")
 
 def set_logger_callback(callback):
     global logger_callback
@@ -1272,510 +1272,242 @@ def _check_network_error(page: ChromiumPage, account_id: str) -> bool:
 
 def _wait_for_place_open_and_click(page: ChromiumPage, target_url: str, main_tab_id: str, account_id: str, max_clicks: Optional[int] = None, max_total_seconds: int = 900) -> bool:
     """
-    监控状态元素：
-    - 先等待出现 Place Success! 作为成功点击提示
-    - 成功后检查 Placing Open，再随机点击 Long/Short
-    - 若提供 max_clicks 则按次数停止，否则从按钮文本里读取剩余次数
-    - [新增] 若出现 "Already placed this round"，刷新重试
+    新策略（低刷新、低干扰）：
+    1) 先判断市场状态 Live / Offline
+    2) Live 时：等待 Placing Open -> 点击 -> 等待 Place Success! -> 等待 You Won!/You Lost
+    3) Offline 时：进入断线处理，每 30 秒刷新一次，直到恢复 Live
     """
     _switch_to_main_and_open(page, main_tab_id, target_url, account_id)
     import time
     log(account_id, "已切回页面，等待 2 秒加载...")
     time.sleep(2)
+
+    def _get_market_status() -> str:
+        try:
+            # 优先匹配状态徽标文本
+            live = page.ele(
+                "xpath://span[contains(@class,'text-emerald-400') and normalize-space()='Live']",
+                timeout=0.08,
+            ) or page.ele("xpath://span[normalize-space()='Live']", timeout=0.08)
+            if live:
+                return "live"
+
+            offline = page.ele(
+                "xpath://span[contains(@class,'text-red-400') and normalize-space()='Offline']",
+                timeout=0.08,
+            ) or page.ele("xpath://span[normalize-space()='Offline']", timeout=0.08)
+            if offline:
+                return "offline"
+            return "unknown"
+        except Exception:
+            return "unknown"
+
+    def _wait_until_live(refresh_seconds: int = 30, market_window_seconds: int = 300) -> bool:
+        log(account_id, "检测到市场 Offline，进入断线恢复流程。")
+        window_start = time.time()
+        last_refresh = 0.0
+        while True:
+            if STOP_FLAG:
+                log(account_id, "收到停止信号，停止监控。")
+                return False
+
+            status = _get_market_status()
+            if status == "live":
+                log(account_id, "市场状态已恢复为 Live。")
+                return True
+
+            now = time.time()
+            if now - last_refresh >= refresh_seconds:
+                try:
+                    page.refresh()
+                    log(account_id, f"市场 Offline，按 {refresh_seconds}s 周期刷新并继续等待 Live...")
+                except Exception as e:
+                    log(account_id, f"Offline 刷新异常: {e}")
+                last_refresh = now
+
+            if now - window_start >= market_window_seconds:
+                log(account_id, "Offline 已持续约 5 分钟，继续按 30 秒刷新等待恢复 Live。")
+                window_start = now
+
+            time.sleep(1)
+
     clicks = 0
     last_progress = time.time()
-    last_remaining = None
-    remaining = max_clicks
-    next_network_check_at = 0.0
+    stage = "wait_open"
+    stage_start = time.time()
+    none_count = 0
+    retry_click_count = 0
     next_popup_check_at = 0.0
-    placing_open_zero_since = None
-    perf_last_log_at = 0.0
-    
-    stage = "wait_settling" # 默认为等待结算，后续根据实际情况跳转
 
-    def _is_zero_countdown() -> bool:
-        try:
-            # 尽量使用精确匹配，避免误命中页面其他隐藏文案
-            return bool(
-                page.ele("xpath://*[normalize-space()='00:00']", timeout=0.08)
-                or page.ele("xpath://div[normalize-space()='0s']", timeout=0.08)
-            )
-        except Exception:
-            return False
-
-    def _perf_tick(stage_name: str, loop_start_ts: float, extra: str = ""):
-        """
-        性能日志节流：每秒最多打印一次，避免日志洪泛。
-        """
-        nonlocal perf_last_log_at
-        if not PERF_DEBUG:
-            return
-        now = time.time()
-        if now - perf_last_log_at < 1.0:
-            return
-        loop_cost_ms = int((now - loop_start_ts) * 1000)
-        suffix = f", {extra}" if extra else ""
-        perf_log(
-            account_id,
-            f"stage={stage_name}, loop_cost={loop_cost_ms}ms, "
-            f"since_progress={int(now - last_progress)}s{suffix}",
-        )
-        perf_last_log_at = now
-
-    # ================= 阶段一：首次点击与确认（含刷新重试逻辑） =================
-    # 使用外层循环包裹，以便在遇到 "Already placed" 时刷新并从头重试首次点击逻辑
     while True:
-        # 0. 检查全局超时/停止
         if STOP_FLAG:
             log(account_id, "收到停止信号，停止监控。")
             return False
+
+        # 保留总超时保护；有进展时会重置 last_progress
         if time.time() - last_progress > max_total_seconds:
             log(account_id, f"长时间无进展，触发超时({max_total_seconds}s)，将结束该窗口。")
             return False
-        
-        # 网络错误检测做节流，避免每轮都读取整页导致反应变慢
-        now_ts = time.time()
-        if now_ts >= next_network_check_at:
-            next_network_check_at = now_ts + 2
-            if _check_network_error(page, account_id):
-                last_progress = time.time() # 重置超时计时
-                continue
 
-        # 1. 等待 Placing Open 并点击 (或检测到已成功/倒计时)
-        log(account_id, "准备寻找 Placing Open 并点击...")
-        phase1_clicked = False
-        
-        while True:
-            loop_begin = time.time()
-            # 检查弹窗（节流，避免每轮扫描全部标签页导致卡顿）
-            now_ts = time.time()
-            if now_ts >= next_popup_check_at:
-                _check_and_handle_popups(page, main_tab_id, account_id)
-                next_popup_check_at = now_ts + 0.3
-            if STOP_FLAG: return False
-            if time.time() - last_progress > max_total_seconds:
-                log(account_id, f"超时({max_total_seconds}s)，退出。")
-                return False
-            
-            # 网络错误检测做节流，避免频繁读取页面
-            now_ts = time.time()
-            if now_ts >= next_network_check_at:
-                next_network_check_at = now_ts + 2
-                if _check_network_error(page, account_id):
-                    last_progress = time.time()
-                    break # 跳出内层循环，重新开始外层循环
-
-            if _is_countdown_state(page):
-                log(account_id, "检测到倒计时状态，结束监控。")
-                return True
-            
-            # 检查是否已有成功标志（可能是刷新后直接显示了结果）
-            if page.ele("t:div@@class=text-white font-semibold text-base@@tx():Place Success!", timeout=0.1) or \
-               page.ele("xpath://div[contains(normalize-space(),'Settling')]", timeout=0.1):
-                log(account_id, "检测到已存在 Place Success! 或 Settling，跳过首次点击。")
-                phase1_clicked = True # 标记为“已处理”，直接进确认阶段
-                break
-
-            placing_open = page.ele(
-                "t:div@@class=flex items-center gap-2 text-xs capitalize text-emerald-400@@tx():Placing Open",
-                timeout=0.1,
-            )
-            if placing_open:
-                first_choice = random.choice(["long", "short"])
-                clicked = False
-                if first_choice == "long":
-                    clicked = _try_detect_and_click(
-                        page,
-                        "t:div@@class=w-full py-3 rounded-lg font-medium text-center transition-all "
-                        "flex items-center justify-center gap-2@@tx():Place Long",
-                        account_id=account_id,
-                        timeout=6,
-                    ) or _try_detect_and_click(
-                        page,
-                        "xpath://div[contains(normalize-space(),'Place Long')]",
-                        account_id=account_id,
-                        timeout=6,
-                    )
-                else:
-                    clicked = _try_detect_and_click(
-                        page,
-                        "t:div@@class=w-full py-3 rounded-lg font-medium text-center transition-all "
-                        "flex items-center justify-center gap-2@@tx():Place Short",
-                        account_id=account_id,
-                        timeout=6,
-                    ) or _try_detect_and_click(
-                        page,
-                        "xpath://div[contains(normalize-space(),'Place Short')]",
-                        account_id=account_id,
-                        timeout=6,
-                    )
-                if clicked:
-                    last_progress = time.time()
-                    phase1_clicked = True
-                    break
-            
-            # 可以在这里也稍微检测一下 Already placed，以防万一
-            if page.ele("xpath://div[contains(normalize-space(),'Already placed this round')]", timeout=0.1):
-                log(account_id, "在等待点击时检测到 'Already placed this round'，刷新页面...")
-                page.refresh()
-                time.sleep(3)
-                continue # 刷新后重新 loop 寻找状态
-
-            _perf_tick("phase1_wait_open", loop_begin, f"placing_open={bool(placing_open)}")
-            time.sleep(0.1)
-
-        # 2. 等待点击生效 (Place Success! / Settling)
-        # 如果是 phase1_clicked 为 True，说明执行了点击或已看到成功，需要确认状态进入下一阶段
-        
-        initial_click_attempts = 1
-        initial_click_last_try = time.time()
-        initial_click_timeout = 10
-        initial_click_max_attempts = 3
-        
-        success_confirmed = False
-        refresh_retry_triggered = False
-
-        while True:
-            loop_begin = time.time()
-            # 检查弹窗（节流）
-            now_ts = time.time()
-            if now_ts >= next_popup_check_at:
-                _check_and_handle_popups(page, main_tab_id, account_id)
-                next_popup_check_at = now_ts + 0.3
-
-            if STOP_FLAG: return False
-            if time.time() - last_progress > max_total_seconds:
-                log(account_id, f"超时({max_total_seconds}s)，退出。")
-                return False
-            
-            # 网络错误检测做节流，避免频繁读取页面
-            now_ts = time.time()
-            if now_ts >= next_network_check_at:
-                next_network_check_at = now_ts + 2
-                if _check_network_error(page, account_id):
-                    last_progress = time.time()
-                    refresh_retry_triggered = True
-                    break
-
-            if _is_countdown_state(page):
-                log(account_id, "检测到倒计时状态，结束监控。")
-                return True
-                
-            success = page.ele(
-                "t:div@@class=text-white font-semibold text-base@@tx():Place Success!",
-                timeout=0.08,
-            )
-            settling = page.ele("xpath://div[contains(normalize-space(),'Settling')]", timeout=0.08)
-            
-            if success:
-                log(account_id, "检测到 Place Success!，开始等待 Settling...")
-                stage = "wait_settling"
-                stage_start = time.time()
-                last_progress = time.time()
-                success_confirmed = True
-                break
-            if settling:
-                log(account_id, "未检测到 Place Success，但检测到 Settling，继续等待 Settling 结束...")
-                stage = "wait_settling"
-                stage_start = time.time()
-                last_progress = time.time()
-                success_confirmed = True
-                break
-
-            # === [新增] 检查 Already placed this round ===
-            already_placed = page.ele("xpath://div[contains(normalize-space(),'Already placed this round')]", timeout=0.1)
-            if already_placed:
-                log(account_id, "检测到 'Already placed this round' (网页卡顿)，刷新页面重试...")
-                page.refresh()
-                time.sleep(3)
-                refresh_retry_triggered = True
-                break # 跳出内层 waiting loop，触发外层 loop 重新开始 (Phase 1)
-
-            # 重试点击逻辑 (如果 Placing Open 再次出现且长时间没成功)
-            placing_open = page.ele(
-                "t:div@@class=flex items-center gap-2 text-xs capitalize text-emerald-400@@tx():Placing Open",
-                timeout=0.08,
-            )
-            if placing_open and time.time() - initial_click_last_try > initial_click_timeout:
-                if initial_click_attempts < initial_click_max_attempts:
-                    initial_click_attempts += 1
-                    initial_click_last_try = time.time()
-                    log(account_id, f"首次点击未生效，重试第 {initial_click_attempts} 次点击。")
-                    retry_choice = random.choice(["long", "short"])
-                    # ... 重用点击逻辑 ...
-                    if retry_choice == "long":
-                        _try_detect_and_click(page, "t:div@@class=w-full py-3 rounded-lg font-medium text-center transition-all flex items-center justify-center gap-2@@tx():Place Long", account_id=account_id, timeout=6) or \
-                        _try_detect_and_click(page, "xpath://div[contains(normalize-space(),'Place Long')]", account_id=account_id, timeout=6)
-                    else:
-                        _try_detect_and_click(page, "t:div@@class=w-full py-3 rounded-lg font-medium text-center transition-all flex items-center justify-center gap-2@@tx():Place Short", account_id=account_id, timeout=6) or \
-                        _try_detect_and_click(page, "xpath://div[contains(normalize-space(),'Place Short')]", account_id=account_id, timeout=6)
-                    last_progress = time.time()
-                else:
-                    log(account_id, "首次点击多次未生效，继续进入监控流程。")
-                    stage = "wait_next_open"
-                    stage_start = time.time()
-                    success_confirmed = True # 强制视为进入监控阶段
-                    break
-            
-            _perf_tick(
-                "phase2_wait_success_or_settling",
-                loop_begin,
-                f"success={bool(success)}, settling={bool(settling)}, placing_open={bool(placing_open)}",
-            )
-            time.sleep(0.1)
-        
-        # 判断是否需要 break 外层循环
-        if refresh_retry_triggered:
-            continue # 重新开始 Phase 1
-        
-        if success_confirmed:
-            break # 成功，进入 Phase 3 (Monitoring)
-
-    # ================= 阶段三：循环监控 =================
-    # 继续沿用上一步的阶段（已设为 wait_settling 或 wait_next_open）
-    none_count = 0
-    while True:
-        loop_begin = time.time()
-        # 检查弹窗（节流）
+        # 弹窗处理节流
         now_ts = time.time()
         if now_ts >= next_popup_check_at:
             _check_and_handle_popups(page, main_tab_id, account_id)
             next_popup_check_at = now_ts + 0.3
 
-        if STOP_FLAG:
-            log(account_id, "收到停止信号，停止监控。")
-            return False
-        if time.time() - last_progress > max_total_seconds:
-            log(account_id, f"长时间无进展，触发超时({max_total_seconds}s)，将结束该窗口。")
-            return False
-        
-        # 网络错误检测做节流，避免频繁读取页面
-        now_ts = time.time()
-        if now_ts >= next_network_check_at:
-            next_network_check_at = now_ts + 2
-            if _check_network_error(page, account_id):
-                last_progress = time.time()
-                stage = "wait_next_open" # 刷新后假设从头开始检测
-                stage_start = time.time()
-                placing_open_zero_since = None
-                continue
+        # 先判市场状态
+        market_status = _get_market_status()
+        if market_status == "offline":
+            if not _wait_until_live(refresh_seconds=30, market_window_seconds=300):
+                return False
+            # 恢复 Live 后重置阶段继续
+            last_progress = time.time()
+            stage = "wait_open"
+            stage_start = time.time()
+            retry_click_count = 0
+            continue
 
         try:
-            # 如果进入倒计时，表示次数已用完
-            if _is_countdown_state(page):
-                log(account_id, "检测到倒计时状态，结束监控。")
-                return True
-
-            # 每次循环都从页面文本读取剩余次数，避免点击失败导致计数错误
+            # 每轮读取剩余次数，避免按点击数误差
             remaining = _get_remaining_clicks(page)
             if remaining is None:
                 none_count += 1
                 if none_count % 20 == 0:
                     log(account_id, "无法解析剩余次数，重试中...")
-                if none_count >= 60:
-                    log(account_id, "连续无法解析剩余次数，视为已结束。")
+                if none_count >= 120:
+                    log(account_id, "长时间无法解析剩余次数，结束本窗口。")
                     return False
-                time.sleep(0.5)
+                time.sleep(0.1)
                 continue
             none_count = 0
-            if last_remaining is not None and remaining < last_remaining:
-                last_progress = time.time()
-            last_remaining = remaining
             if remaining <= 0:
                 log(account_id, "剩余次数为 0，结束监控。")
                 return True
+
             placing_open = page.ele(
                 "t:div@@class=flex items-center gap-2 text-xs capitalize text-emerald-400@@tx():Placing Open",
                 timeout=0.05,
             )
-            settling = page.ele("xpath://div[contains(normalize-space(),'Settling')]", timeout=0.05)
             success = page.ele(
                 "t:div@@class=text-white font-semibold text-base@@tx():Place Success!",
                 timeout=0.05,
             )
+            won = page.ele("xpath://*[contains(normalize-space(),'You Won')]", timeout=0.05)
+            lost = page.ele("xpath://*[contains(normalize-space(),'You Lost')]", timeout=0.05)
 
-            if stage in ("wait_first_open", "wait_next_open"):
-                if placing_open:
-                    # 只有进入 00:00 后才开始计时，连续超过 10 秒才判定卡死
-                    if _is_zero_countdown():
-                        if placing_open_zero_since is None:
-                            placing_open_zero_since = time.time()
-                        elif time.time() - placing_open_zero_since >= 30:
-                            log(account_id, "检测到 Placing Open 且 00:00 持续超过30s，判定为卡死，刷新页面...")
-                            page.refresh()
-                            time.sleep(3)
-                            stage = "wait_next_open"
-                            stage_start = time.time()
-                            placing_open_zero_since = None
-                            continue
-                        time.sleep(0.1)
-                        continue
-                    else:
-                        placing_open_zero_since = None
-
-                    log(account_id, "检测到 Placing Open，随机点击 Long/Short。")
+            if stage == "wait_open":
+                # Live + Placing Open 才尝试点击
+                if market_status == "live" and placing_open:
+                    log(account_id, "市场 Live 且检测到 Placing Open，随机点击 Long/Short。")
                     choice = random.choice(["long", "short"])
+                    clicked = False
                     if choice == "long":
-                        if _try_detect_and_click(
+                        clicked = _try_detect_and_click(
                             page,
                             "t:div@@class=w-full py-3 rounded-lg font-medium text-center transition-all "
                             "flex items-center justify-center gap-2@@tx():Place Long",
                             account_id=account_id,
-                            timeout=6,
+                            timeout=4,
                         ) or _try_detect_and_click(
                             page,
                             "xpath://div[contains(normalize-space(),'Place Long')]",
                             account_id=account_id,
-                            timeout=6,
-                        ):
-                            clicks += 1
-                            last_progress = time.time()
+                            timeout=4,
+                        )
                     else:
-                        if _try_detect_and_click(
+                        clicked = _try_detect_and_click(
                             page,
                             "t:div@@class=w-full py-3 rounded-lg font-medium text-center transition-all "
                             "flex items-center justify-center gap-2@@tx():Place Short",
                             account_id=account_id,
-                            timeout=6,
+                            timeout=4,
                         ) or _try_detect_and_click(
                             page,
                             "xpath://div[contains(normalize-space(),'Place Short')]",
                             account_id=account_id,
-                            timeout=6,
-                        ):
-                            clicks += 1
-                            last_progress = time.time()
-                    # 点击后稍等再读取一次剩余次数，避免显示滞后
-                    time.sleep(0.5)
-                    remaining_after = _get_remaining_clicks(page)
-                    if remaining_after is None:
-                        remaining_after = remaining
-                    log(account_id, f"已点击次数: {clicks}，剩余可点击: {remaining_after}")
-                    stage = "wait_success"
-                    stage_start = time.time()
-                # === [新增] 检查 00:00 卡死 ===
-                elif time.time() - stage_start > 30 and _is_zero_countdown():
-                    log(account_id, "在等待开盘阶段检测到倒计时归零但未开盘，刷新页面...")
-                    page.refresh()
-                    time.sleep(3)
-                    stage = "wait_next_open"
-                    stage_start = time.time()
-                    placing_open_zero_since = None
-                    continue
-                else:
-                    placing_open_zero_since = None
-                    _perf_tick(
-                        "wait_next_open",
-                        loop_begin,
-                        f"remaining={remaining}, placing_open={bool(placing_open)}, settling={bool(settling)}, success={bool(success)}",
-                    )
-                    time.sleep(0.1)
-                continue
+                            timeout=4,
+                        )
+                    if clicked:
+                        clicks += 1
+                        last_progress = time.time()
+                        stage = "wait_success"
+                        stage_start = time.time()
+                        retry_click_count = 0
+                        time.sleep(0.2)
+                        continue
 
-            if stage == "wait_success":
+            elif stage == "wait_success":
+                # 点击后等待 success；有时会直接出结果
                 if success:
-                    log(account_id, "检测到 Place Success!，等待 Settling 出现...")
-                    stage = "wait_settling"
-                    stage_start = time.time()
+                    log(account_id, "检测到 Place Success!，等待本轮结果...")
                     last_progress = time.time()
-                elif settling:
-                    log(account_id, "未检测到 Place Success，但检测到 Settling，继续等待 Settling 结束...")
-                    stage = "wait_settling"
+                    stage = "wait_result"
                     stage_start = time.time()
+                    continue
+
+                if won or lost:
+                    result_text = "You Won!" if won else "You Lost"
+                    log(account_id, f"检测到本轮结果: {result_text}，继续下一轮。")
                     last_progress = time.time()
-                # === [新增] 检查 Already placed this round ===
-                elif page.ele("xpath://div[contains(normalize-space(),'Already placed this round')]", timeout=0.1):
-                    log(account_id, "监控中检测到 'Already placed'，刷新...")
-                    page.refresh()
-                    time.sleep(3)
-                    stage = "wait_next_open" 
+                    stage = "wait_open"
                     stage_start = time.time()
                     continue
-                # === [新增] 检查 00:00 卡死 (在等待 Success 期间) ===
-                elif time.time() - stage_start > 30 and _is_zero_countdown():
-                    log(account_id, "在等待 Success 阶段检测到倒计时归零，刷新页面...")
-                    page.refresh()
-                    time.sleep(3)
-                    stage = "wait_next_open"
-                    stage_start = time.time()
-                    continue
-                elif time.time() - stage_start > 60:
-                    log(account_id, "等待 Place Success 超时，继续等待下一个 Placing Open...")
-                    stage = "wait_next_open"
-                    stage_start = time.time()
-                _perf_tick(
-                    "wait_success",
-                    loop_begin,
-                    f"remaining={remaining}, settling={bool(settling)}, success={bool(success)}",
-                )
-                time.sleep(0.05)
-                continue
 
-            if stage == "wait_settling":
-                if settling:
-                    # log(account_id, "检测到 Settling，等待 Settling 结束...")
-                    stage = "wait_settling_clear"
-                    stage_start = time.time()
-                # === [新增] 检查 00:00 卡死 ===
-                elif time.time() - stage_start > 30 and _is_zero_countdown():
-                    log(account_id, "在 Settling 阶段检测到倒计时归零但状态未变，刷新页面...")
-                    page.refresh()
-                    time.sleep(3)
-                    stage = "wait_next_open"
-                    stage_start = time.time()
-                    continue
-                elif time.time() - stage_start > 30:
-                    log(account_id, "等待 Settling 超时(30s)，刷新页面...")
-                    page.refresh()
-                    time.sleep(3)
-                    stage = "wait_next_open"
-                    stage_start = time.time()
-                _perf_tick(
-                    "wait_settling",
-                    loop_begin,
-                    f"remaining={remaining}, settling={bool(settling)}",
-                )
-                time.sleep(0.05)
-                continue
-
-            if stage == "wait_settling_clear":
-                if not settling:
-                    log(account_id, "Settling 已结束，等待下一个 Placing Open...")
-                    stage = "wait_next_open"
-                    stage_start = time.time()
-                # === [新增] 检查 00:00 卡死 ===
-                elif time.time() - stage_start > 30 and _is_zero_countdown():
-                    log(account_id, "在 Settling Clear 阶段检测到倒计时归零但状态未变，刷新页面...")
-                    page.refresh()
-                    time.sleep(3)
-                    stage = "wait_next_open"
+                # 若还在开盘且 success 未出现，允许小次数重试点击，不做刷新
+                if placing_open and time.time() - stage_start > 6 and retry_click_count < 2:
+                    retry_click_count += 1
+                    log(account_id, f"等待 Success 中，执行第 {retry_click_count} 次补点。")
+                    choice = random.choice(["long", "short"])
+                    if choice == "long":
+                        _try_detect_and_click(
+                            page,
+                            "xpath://div[contains(normalize-space(),'Place Long')]",
+                            account_id=account_id,
+                            timeout=3,
+                        )
+                    else:
+                        _try_detect_and_click(
+                            page,
+                            "xpath://div[contains(normalize-space(),'Place Short')]",
+                            account_id=account_id,
+                            timeout=3,
+                        )
+                    last_progress = time.time()
                     stage_start = time.time()
                     continue
-                elif time.time() - stage_start > 30:
-                    log(account_id, "Settling 结束等待超时(30s)，刷新页面...")
-                    page.refresh()
-                    time.sleep(3)
-                    stage = "wait_next_open"
-                    stage_start = time.time()
-                _perf_tick(
-                    "wait_settling_clear",
-                    loop_begin,
-                    f"remaining={remaining}, settling={bool(settling)}",
-                )
-                time.sleep(0.05)
-                continue
 
-            _perf_tick(
-                stage,
-                loop_begin,
-                f"remaining={remaining}, placing_open={bool(placing_open)}, settling={bool(settling)}, success={bool(success)}",
-            )
-            time.sleep(0.2)
+                if time.time() - stage_start > 30:
+                    log(account_id, "等待 Place Success 超时，重置到下一轮等待。")
+                    stage = "wait_open"
+                    stage_start = time.time()
+                    continue
+
+            elif stage == "wait_result":
+                if won or lost:
+                    result_text = "You Won!" if won else "You Lost"
+                    log(account_id, f"本轮结果: {result_text}，继续下一轮。")
+                    last_progress = time.time()
+                    stage = "wait_open"
+                    stage_start = time.time()
+                    continue
+
+                if time.time() - stage_start > 90:
+                    log(account_id, "等待本轮结果超时，重置到下一轮等待。")
+                    stage = "wait_open"
+                    stage_start = time.time()
+                    continue
+
+            if PERF_DEBUG:
+                perf_log(
+                    account_id,
+                    f"stage={stage}, market={market_status}, remaining={remaining}, "
+                    f"open={bool(placing_open)}, success={bool(success)}, won={bool(won)}, lost={bool(lost)}",
+                )
+
+            time.sleep(0.1)
         except Exception as e:
             log(account_id, f"检测状态异常: {e}")
-            time.sleep(0.3)
-    log(account_id, f"已完成点击 {clicks} 次，结束监控。")
-    return True
+            time.sleep(0.2)
 
 
 def _claim_all_rewards(page: ChromiumPage, tasks_url: str, main_tab_id: str, account_id: str) -> bool:
